@@ -12,6 +12,7 @@ import signal
 import socket
 import tempfile
 import uuid
+import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -68,7 +69,13 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               TokenizeResponse,
                                               TranscriptionRequest,
                                               TranscriptionResponse,
-                                              UnloadLoRAAdapterRequest)
+                                              UnloadLoRAAdapterRequest,
+                                              VerifiedCompletionRequest,
+                                              VerifiedCompletionResponse,
+                                              VerifiedChatCompletionRequest,
+                                              VerifiedChatCompletionResponse,
+                                              VerifyDecodingRequest,
+                                              VerifyDecodingResponse)
 # yapf: enable
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
@@ -809,6 +816,69 @@ if envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
                                 status_code=response.code)
 
         return Response(status_code=200, content=response)
+
+
+# New Verified Endpoints
+
+@router.post("/v1/completions/verified",
+             response_model=VerifiedCompletionResponse,
+             dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def create_verified_completion(
+    request: VerifiedCompletionRequest,
+    raw_request: Request
+) -> VerifiedCompletionResponse:
+    """Generate text completion with verification data (token ids, logprobs). Enforces temperature=0."""
+    serv_completion = completion(raw_request)
+    if serv_completion is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Completion model not found.")
+
+    # Delegate to the new method in OpenAIServingCompletion
+    return await serv_completion.create_verified_completion(request, raw_request)
+
+@router.post("/v1/chat/completions/verified",
+             response_model=VerifiedChatCompletionResponse,
+             dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def create_verified_chat_completion(
+    request: VerifiedChatCompletionRequest,
+    raw_request: Request
+) -> VerifiedChatCompletionResponse:
+    """Generate chat completion with verification data (token ids, logprobs). Enforces temperature=0."""
+    serv_chat = chat(raw_request)
+    if serv_chat is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Chat model not found.")
+
+    # Delegate to the new method in OpenAIServingChat
+    return await serv_chat.create_verified_chat_completion(request, raw_request)
+
+@router.post("/v1/verify_decoding",
+             response_model=VerifyDecodingResponse,
+             dependencies=[Depends(validate_json_request)])
+@with_cancellation
+async def verify_text_decoding(
+    request: VerifyDecodingRequest,
+    raw_request: Request
+) -> VerifyDecodingResponse:
+    """Verify if a given completion for a prompt was generated via greedy decoding."""
+    serv_completion = completion(raw_request)
+    if serv_completion is None:
+        # Fallback or error if completion service is not available for some reason
+        # (e.g. model type doesn't support completions, though verify_decoding should be generic enough)
+        # For now, let's try to use the base serving instance if completion is None, 
+        # but ideally, verify_decoding should be on a service that is always available or clearly linked.
+        # If OpenAIServingCompletion is the definitive place, then this fallback might indicate a setup issue.
+        # However, verify_decoding was previously on OpenAIServing.
+        # Reverting to a more direct error if OpenAIServingCompletion isn't found.
+        base_handler = base(raw_request)
+        if hasattr(base_handler, 'verify_decoding') and callable(getattr(base_handler, 'verify_decoding')):
+             logger.warning("Verify_decoding called on base_handler as completion_handler was not available.")
+             return await base_handler.verify_decoding(request, raw_request)
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Completion model not found, cannot verify decoding.")
+
+    return await serv_completion.verify_decoding(request, raw_request)
 
 
 def build_app(args: Namespace) -> FastAPI:

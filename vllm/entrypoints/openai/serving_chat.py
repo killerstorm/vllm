@@ -25,7 +25,9 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse, ChatMessage, DeltaFunctionCall, DeltaMessage,
     DeltaToolCall, ErrorResponse, FunctionCall, FunctionDefinition,
-    PromptTokenUsageInfo, RequestResponseMetadata, ToolCall, UsageInfo)
+    PromptTokenUsageInfo, RequestResponseMetadata, ToolCall, UsageInfo,
+    VerifiedChatCompletionRequest, VerifiedChatCompletionResponse,
+    VerifiedChatCompletionResponseChoice, VerifiedTokenDetail)
 from vllm.entrypoints.openai.serving_engine import (OpenAIServing,
                                                     clamp_prompt_logprobs)
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
@@ -41,6 +43,7 @@ from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
                                                 truncate_tool_call_ids,
                                                 validate_request_params)
+from http import HTTPStatus
 
 logger = init_logger(__name__)
 
@@ -913,9 +916,10 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = self._create_chat_logprobs(
                     token_ids=token_ids,
                     top_logprobs=out_logprobs,
-                    num_output_top_logprobs=request.top_logprobs,
                     tokenizer=tokenizer,
-                    return_as_token_id=request.return_tokens_as_token_ids,
+                    num_output_top_logprobs=request.top_logprobs,
+                    return_as_token_id=request.
+                    return_tokens_as_token_ids,
                 )
             else:
                 logprobs = None
@@ -1177,4 +1181,224 @@ class OpenAIServingChat(OpenAIServing):
             and delta_message.tool_calls and delta_message.tool_calls[0]
             and delta_message.tool_calls[0].function
             and delta_message.tool_calls[0].function.arguments is not None
+        )
+
+    def _create_verified_token_details(
+        self,
+        token_ids: Optional[GenericSequence[int]],
+        sample_logprobs: Optional[GenericSequence[Optional[dict[int, Logprob]]]],
+        tokenizer: AnyTokenizer,
+        is_prompt_tokens: bool = False,
+    ) -> Optional[list[VerifiedTokenDetail]]:
+        if not token_ids:
+            return None
+        # If logprobs were not requested for prompt, sample_logprobs might be None or empty for prompt_token_ids
+        if is_prompt_tokens and (sample_logprobs is None or not sample_logprobs):
+            # Still create details but without logprob info if only token_ids are present for prompt
+            return [VerifiedTokenDetail(token_id=tid, text=tokenizer.decode(tid), logprob=0.0, rank=None) for tid in token_ids]
+        
+        if sample_logprobs is None: # Should not happen if logprobs are requested for completion tokens
+             if not is_prompt_tokens:
+                logger.warning("sample_logprobs is None for completion tokens, cannot create verified details.")
+             return [VerifiedTokenDetail(token_id=tid, text=tokenizer.decode(tid), logprob=0.0, rank=None) for tid in token_ids]
+
+        details: list[VerifiedTokenDetail] = []
+        for i, token_id in enumerate(token_ids):
+            step_logprobs_dict = sample_logprobs[i] if i < len(sample_logprobs) else None
+
+            if step_logprobs_dict is not None and token_id in step_logprobs_dict:
+                logprob_obj = step_logprobs_dict[token_id]
+                details.append(VerifiedTokenDetail(
+                    token_id=token_id,
+                    text=logprob_obj.decoded_token,
+                    logprob=logprob_obj.logprob,
+                    rank=logprob_obj.rank
+                ))
+            elif is_prompt_tokens and i == 0 and step_logprobs_dict is None:
+                details.append(VerifiedTokenDetail(
+                    token_id=token_id,
+                    text=tokenizer.decode(token_id),
+                    logprob=0.0, 
+                    rank=None
+                ))
+            else:
+                logger.debug(f"Missing logprob for chat token_id {token_id} at index {i}. is_prompt={is_prompt_tokens}. Logprobs for this step: {step_logprobs_dict}")
+                details.append(VerifiedTokenDetail(
+                    token_id=token_id,
+                    text=tokenizer.decode(token_id),
+                    logprob=0.0,
+                    rank=None
+                ))
+        return details
+
+    async def create_verified_chat_completion(
+        self,
+        request: VerifiedChatCompletionRequest,
+        raw_request: Request,
+    ) -> Union[VerifiedChatCompletionResponse, ErrorResponse]:
+        error_check_ret = await self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
+
+        # Use default tokenizer
+        tokenizer = await self.engine_client.get_tokenizer()
+        # Correctly get tokenizer_group - now passing the tokenizer object itself
+        # tokenizer_group = await self.engine_client.get_tokenizer_group()
+
+        request_id = f"vchatcmpl-{self._base_request_id(raw_request)}"
+        created_time = int(time.time())
+
+        request_copy = request.model_copy(deep=True)
+        request_copy.temperature = 0.0
+        request_copy.n = 1
+        if request_copy.logprobs is None:
+             request_copy.logprobs = True # Enable logprobs for completion
+        if request_copy.top_logprobs is None or request_copy.top_logprobs == 0:
+            request_copy.top_logprobs = 1 # Ensure we get at least the sampled token's logprob info
+
+        try:
+            # Use _preprocess_chat to get engine-ready inputs
+            (_conversation, _request_prompts, engine_prompts_list) = await self._preprocess_chat(
+                request=request_copy,
+                tokenizer=tokenizer,
+                messages=request_copy.messages,
+                chat_template=request_copy.chat_template or self.chat_template,
+                chat_template_content_format=self.chat_template_content_format, # Use instance's format
+                add_generation_prompt=request_copy.add_generation_prompt, # From request_copy
+                # Ensure other relevant parameters for _preprocess_chat are passed if needed,
+                # e.g., tool_dicts, documents, chat_template_kwargs from request_copy
+            )
+            
+            if not engine_prompts_list:
+                return self.create_error_response("Failed to process chat messages into engine prompts.",
+                                                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            
+            # Since n=1, we expect one engine_prompt
+            engine_prompt_input_dict = engine_prompts_list[0]
+
+            # (engine_inputs, _, _, actual_prompt_token_ids_from_engine, _, mm_kwargs) = \\
+            #     await self._process_model_inputs(request_id, engine_prompt_input, request_copy)
+            
+            # Directly use outputs from _preprocess_chat
+            engine_inputs = engine_prompt_input_dict # This is the TokensPrompt dict
+            actual_prompt_token_ids = list(engine_prompt_input_dict.get("prompt_token_ids", []))
+            mm_kwargs = {}
+            if "multi_modal_data" in engine_prompt_input_dict:
+                mm_kwargs["multi_modal_data"] = engine_prompt_input_dict["multi_modal_data"]
+            # If _process_model_inputs was also extracting other specific mm_kwargs, ensure they are handled
+            # For example, if engine_prompt_input_dict might have mm_processor_kwargs directly:
+            if "mm_processor_kwargs" in engine_prompt_input_dict:
+                 mm_kwargs["mm_processor_kwargs"] = engine_prompt_input_dict["mm_processor_kwargs"]
+            if hasattr(request_copy, "cache_salt") and request_copy.cache_salt is not None:
+                # engine_inputs is a dict, so we can add to it if it's not already there from _preprocess_chat
+                if "cache_salt" not in engine_inputs:
+                    engine_inputs["cache_salt"] = request_copy.cache_salt
+
+            # actual_prompt_token_ids = actual_prompt_token_ids_from_engine if actual_prompt_token_ids_from_engine is not None else []
+
+            sampling_params = request_copy.to_sampling_params(
+                default_max_tokens=self.max_model_len,
+                logits_processor_pattern=self.logits_processor_pattern,
+                default_sampling_params=self.default_sampling_params,
+            )
+            sampling_params.temperature = 0.0
+            sampling_params.n = 1
+            # Ensure logprobs for SampleLogprobs (output.logprobs)
+            if sampling_params.logprobs is None or sampling_params.logprobs == 0:
+                 sampling_params.logprobs = 1 
+            # request_copy.prompt_logprobs (which maps to sampling_params.prompt_logprobs) is used if set by user
+
+        except ValueError as e:
+            logger.error(f"Error processing verified chat request: {e}", exc_info=True)
+            return self.create_error_response(str(e), status_code=HTTPStatus.BAD_REQUEST)
+        except Exception as e:
+            logger.error(f"Unexpected error setting up verified chat request: {e}", exc_info=True)
+            return self.create_error_response(f"Internal server error: {e}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        result_generator = self.engine_client.generate(
+            prompt=engine_inputs, 
+            sampling_params=sampling_params, 
+            request_id=request_id, 
+            **mm_kwargs
+        )
+        final_res: Optional[RequestOutput] = None
+        try:
+            async for res_output in result_generator:
+                if isinstance(res_output, Exception):
+                    logger.error(f"Error during generation for verified chat: {res_output}", exc_info=True)
+                    return self.create_error_response(f"Engine error: {str(res_output)}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+                final_res = res_output
+        except Exception as e:
+            logger.error(f"Error consuming result_generator for verified chat: {e}", exc_info=True)
+            return self.create_error_response(f"Error during engine generation: {e}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        if final_res is None or not final_res.outputs:
+            logger.error("No output received from generation engine for verified chat.")
+            return self.create_error_response("No output from engine.", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        completion_output = final_res.outputs[0]
+        actual_completion_token_ids = list(completion_output.token_ids)
+        generated_text_content = completion_output.text
+
+        completion_details = self._create_verified_token_details(
+            actual_completion_token_ids,
+            completion_output.logprobs,
+            tokenizer
+        )
+
+        prompt_details = None
+        engine_prompt_token_ids = final_res.prompt_token_ids if final_res.prompt_token_ids is not None else []
+        if final_res.prompt_logprobs and engine_prompt_token_ids:
+            prompt_details = self._create_verified_token_details(
+                engine_prompt_token_ids,
+                clamp_prompt_logprobs(final_res.prompt_logprobs),
+                tokenizer,
+                is_prompt_tokens=True
+            )
+        elif engine_prompt_token_ids:
+             prompt_details = self._create_verified_token_details(
+                engine_prompt_token_ids,
+                None, 
+                tokenizer,
+                is_prompt_tokens=True
+            )
+
+        # For chat, the response structure includes a ChatMessage
+        # We don't typically return tool calls for a simple verified text generation focused on logprobs.
+        # If tools were used leading to this response, their handling is outside this verified path for now.
+        chat_message = ChatMessage(role="assistant", content=generated_text_content)
+
+        choice = VerifiedChatCompletionResponseChoice(
+            index=0,
+            message=chat_message,
+            prompt_token_ids=engine_prompt_token_ids,
+            completion_token_ids=actual_completion_token_ids,
+            completion_token_details=completion_details or [],
+            prompt_token_details=prompt_details,
+            finish_reason=completion_output.finish_reason,
+            stop_reason=completion_output.stop_reason
+        )
+
+        num_prompt_tokens = len(engine_prompt_token_ids)
+        num_completion_tokens = len(actual_completion_token_ids)
+        usage = UsageInfo(
+            prompt_tokens=num_prompt_tokens,
+            completion_tokens=num_completion_tokens,
+            total_tokens=num_prompt_tokens + num_completion_tokens,
+            prompt_tokens_details=PromptTokenUsageInfo(cached_tokens=final_res.num_cached_tokens) if final_res.num_cached_tokens is not None else None
+        )
+        
+        response_metadata = RequestResponseMetadata(request_id=request_id, final_usage_info=usage)
+        if raw_request and hasattr(raw_request.state, "request_metadata"):
+            raw_request.state.request_metadata = response_metadata
+        
+        model_name = self._get_model_name(request.model)
+
+        return VerifiedChatCompletionResponse(
+            id=request_id,
+            object="chat.completion.verified",
+            created=created_time,
+            model=model_name,
+            choices=[choice],
+            usage=usage
         )

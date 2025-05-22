@@ -1818,3 +1818,103 @@ class TranscriptionResponseVerbose(OpenAIBaseModel):
 
     words: Optional[list[TranscriptionWord]] = None
     """Extracted words and their corresponding timestamps."""
+
+
+# === Added for Verified Generation ===
+
+class VerifiedTokenDetail(OpenAIBaseModel):
+    token_id: int
+    text: Optional[str] = None # Decoded token text, if available
+    logprob: float
+    rank: Optional[int] = None # Rank of this token (1 if it was the top choice)
+    # Potentially add top_k_alternatives if easily available and desired
+    # top_k_alternatives: Optional[dict[str, float]] = None # {token_text: logprob}
+
+# --- Verified Completion Endpoint ---
+class VerifiedCompletionRequest(CompletionRequest):
+    # Inherits fields from CompletionRequest.
+    # We will enforce temperature=0 and logprobs=True (or specific value)
+    # in the handler.
+    pass
+
+class VerifiedCompletionResponseChoice(OpenAIBaseModel):
+    index: int
+    text: str
+    prompt_token_ids: list[int]
+    completion_token_ids: list[int]
+    # Logprobs for each token in completion_token_ids
+    completion_token_details: list[VerifiedTokenDetail]
+    # Optional: Logprobs for each token in prompt_token_ids (if requested via prompt_logprobs)
+    prompt_token_details: Optional[list[VerifiedTokenDetail]] = None
+    finish_reason: Optional[str] = None
+    stop_reason: Union[int, str, None] = None # From CompletionResponseChoice
+
+class VerifiedCompletionResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"cmpl-verified-{random_uuid()}")
+    object: str = "text_completion.verified"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[VerifiedCompletionResponseChoice]
+    usage: UsageInfo
+
+# --- Verified Chat Completion Endpoint ---
+class VerifiedChatCompletionRequest(ChatCompletionRequest):
+    # Inherits fields from ChatCompletionRequest.
+    # We will enforce temperature=0 and logprobs=True (or specific value)
+    # in the handler.
+    pass
+
+class VerifiedChatCompletionResponseChoice(OpenAIBaseModel):
+    index: int
+    message: ChatMessage  # Contains role and generated content (text)
+    prompt_token_ids: list[int] # Token IDs for the full prompt context
+    completion_token_ids: list[int] # Token IDs for the assistant's message content
+    # Logprobs for each token in completion_token_ids (assistant's message)
+    completion_token_details: list[VerifiedTokenDetail]
+    # Optional: Logprobs for each token in prompt_token_ids (if requested via prompt_logprobs)
+    prompt_token_details: Optional[list[VerifiedTokenDetail]] = None
+    finish_reason: Optional[str] = "stop" # From ChatCompletionResponseChoice
+    stop_reason: Union[int, str, None] = None # From ChatCompletionResponseChoice
+
+
+class VerifiedChatCompletionResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-verified-{random_uuid()}")
+    object: Literal["chat.completion.verified"] = "chat.completion.verified"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: list[VerifiedChatCompletionResponseChoice]
+    usage: UsageInfo
+
+# --- Verify Decoding Endpoint ---
+class VerifyDecodingRequest(OpenAIBaseModel):
+    model: Optional[str] = None
+    prompt: Union[str, list[int]] # Can be text or token IDs
+    completion: Union[str, list[int]] # Can be text or token IDs
+    prompt_logprobs: Optional[int] = Field(default=None, description="The number of logprobs to return for the prompt. If None, defaults to 0.")
+    # For verifying against greedy decoding. If false, any token is "verified" as long as we get its logprob.
+    check_greedy: bool = Field(default=True)
+    # If check_greedy is true, this threshold allows for small floating point differences.
+    # The generated token's logprob must be >= (top_logprob - logprob_threshold).
+    greedy_logprob_threshold: float = Field(default=0.001)
+
+class TokenVerificationDetail(OpenAIBaseModel):
+    token_id: int
+    text: Optional[str] = None
+    logprob: float              # Logprob of this token_id
+    is_greedy_choice: Optional[bool] = None # Only if check_greedy was true
+    top_logprob_at_step: Optional[float] = None # The highest logprob at this token's generation step
+    top_token_id_at_step: Optional[int] = None # The token_id with the highest logprob
+    error_message: Optional[str] = None
+    rank: Optional[int] = None
+
+class VerifyDecodingResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"verdec-{random_uuid()}")
+    object: str = "text.verification"
+    model: str
+    is_verified_greedy: Optional[bool] = None
+    prompt_token_ids: Optional[list[int]] = None
+    completion_token_ids: Optional[list[int]] = None
+    verification_details: list[TokenVerificationDetail]
+    usage: UsageInfo
+
+# === End Added for Verified Generation ===

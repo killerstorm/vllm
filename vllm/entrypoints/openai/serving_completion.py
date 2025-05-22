@@ -2,9 +2,11 @@
 
 import asyncio
 import time
+from abc import ABC
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import Optional, Union, cast
+from http import HTTPStatus
 
 import jinja2
 from fastapi import Request
@@ -22,7 +24,15 @@ from vllm.entrypoints.openai.protocol import (CompletionLogProbs,
                                               CompletionStreamResponse,
                                               ErrorResponse,
                                               RequestResponseMetadata,
-                                              UsageInfo)
+                                              UsageInfo,
+                                              VerifiedCompletionRequest,
+                                              VerifiedCompletionResponse,
+                                              VerifiedCompletionResponseChoice,
+                                              VerifiedTokenDetail,
+                                              VerifyDecodingRequest,
+                                              VerifyDecodingResponse,
+                                              TokenVerificationDetail
+                                            )
 # yapf: enable
 from vllm.entrypoints.openai.serving_engine import (OpenAIServing,
                                                     clamp_prompt_logprobs)
@@ -32,7 +42,8 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.sequence import Logprob
 from vllm.transformers_utils.tokenizer import AnyTokenizer
-from vllm.utils import merge_async_iterators
+from vllm.utils import merge_async_iterators, random_uuid
+from vllm.inputs import TokensPrompt
 
 logger = init_logger(__name__)
 
@@ -554,4 +565,472 @@ class OpenAIServingCompletion(OpenAIServing):
             token_logprobs=out_token_logprobs,
             tokens=out_tokens,
             top_logprobs=out_top_logprobs,
+        )
+
+    def _get_decoded_token(
+        self,
+        logprob: Logprob,
+        token_id: int,
+        tokenizer: AnyTokenizer,
+        return_as_token_id: Optional[bool] = None,
+    ) -> str:
+        should_return_as_token_id = return_as_token_id if \
+            return_as_token_id is not None else self.return_tokens_as_token_ids
+        if should_return_as_token_id:
+            return f"token_id:{token_id}"
+        # Note: This may not be the true token if the tokenizer is not faithful.
+        # But it's the best we can do without returning bytes.
+        return logprob.decoded_token
+
+    # === New methods for Verified Completion ===
+
+    def _create_verified_token_details(
+        self,
+        token_ids: Optional[GenericSequence[int]],
+        sample_logprobs: Optional[GenericSequence[Optional[dict[int, Logprob]]]],
+        tokenizer: AnyTokenizer,
+        # Specify if these are prompt tokens, as the first prompt token might have no logprob
+        is_prompt_tokens: bool = False,
+    ) -> Optional[list[VerifiedTokenDetail]]:
+        if not token_ids or sample_logprobs is None:
+            # If logprobs were not requested for prompt, sample_logprobs might be None or empty for prompt_token_ids
+            if is_prompt_tokens and token_ids and (sample_logprobs is None or not sample_logprobs):
+                # Still create details but without logprob info if only token_ids are present for prompt
+                return [VerifiedTokenDetail(token_id=tid, text=tokenizer.decode(tid), logprob=0.0, rank=None) for tid in token_ids]
+            return None
+
+        details: list[VerifiedTokenDetail] = []
+        for i, token_id in enumerate(token_ids):
+            # Ensure we don't go out of bounds for sample_logprobs
+            step_logprobs_dict = sample_logprobs[i] if i < len(sample_logprobs) else None
+
+            if step_logprobs_dict is not None and token_id in step_logprobs_dict:
+                logprob_obj = step_logprobs_dict[token_id]
+                details.append(VerifiedTokenDetail(
+                    token_id=token_id,
+                    text=logprob_obj.decoded_token,
+                    logprob=logprob_obj.logprob,
+                    rank=logprob_obj.rank
+                ))
+            elif is_prompt_tokens and i == 0 and step_logprobs_dict is None:
+                # First prompt token often has no logprob, decode manually
+                details.append(VerifiedTokenDetail(
+                    token_id=token_id,
+                    text=tokenizer.decode(token_id),
+                    logprob=0.0, # Or float('nan') if preferred
+                    rank=None
+                ))
+            else:
+                # This case might be hit if logprobs are missing for a specific token
+                logger.debug(f"Missing logprob for token_id {token_id} at index {i} during verified detail creation. is_prompt={is_prompt_tokens}. Logprobs for this step: {step_logprobs_dict}")
+                details.append(VerifiedTokenDetail(
+                    token_id=token_id,
+                    text=tokenizer.decode(token_id), # Manual decode as fallback
+                    logprob=0.0, # Default or error indicator
+                    rank=None
+                ))
+        return details
+
+    async def create_verified_completion(
+        self,
+        request: VerifiedCompletionRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[VerifiedCompletionResponse, ErrorResponse]:
+        error_check_ret = await self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
+
+        # Use default tokenizer
+        tokenizer = await self.engine_client.get_tokenizer()
+
+        request_id = f"vcmpl-{self._base_request_id(raw_request)}"
+        created_time = int(time.time())
+
+        request_copy = request.model_copy(deep=True)
+        request_copy.temperature = 0.0
+        request_copy.n = 1
+        if request_copy.logprobs is None or request_copy.logprobs == 0:
+            request_copy.logprobs = 1 # Ensure we get at least the sampled token's logprob
+        # prompt_logprobs are used if set by the user in the request_copy
+
+        # First, tokenize the prompt to get the number of tokens for max_tokens calculation
+        prompt_input_for_max_tokens = self._tokenize_prompt_input(request_copy, tokenizer, request_copy.prompt)
+        num_prompt_tokens_for_max_tokens = len(prompt_input_for_max_tokens["prompt_token_ids"])
+
+        if request_copy.max_tokens is None:
+            request_copy.max_tokens = self.max_model_len - num_prompt_tokens_for_max_tokens
+
+        # Ensure max_tokens is not negative if prompt is too long
+        if request_copy.max_tokens < 0:
+            request_copy.max_tokens = 0
+            
+        try:
+            # For verified completion, the prompt_input for _process_model_inputs should be based on request_copy.prompt
+            # The prompt_input_for_max_tokens was specifically for length calculation.
+            # We re-tokenize here to ensure the prompt_input for the engine is fresh and complete.
+            prompt_input = self._tokenize_prompt_input(request_copy, tokenizer, request_copy.prompt)
+
+            # Correctly prepare engine_inputs for OpenAIServingCompletion
+            # Mimic parts of _preprocess_completion or standard completion setup
+            engine_inputs: TokensPrompt = {"prompt_token_ids": prompt_input["prompt_token_ids"]}
+            # If your request_copy or prompt_input could contain multi-modal data:
+            # if "multi_modal_data" in prompt_input:
+            #    engine_inputs["multi_modal_data"] = prompt_input["multi_modal_data"]
+            
+            actual_prompt_token_ids = list(prompt_input["prompt_token_ids"]) # Direct assignment
+            mm_kwargs = {} # Typically no mm_kwargs for simple completion
+
+            # (engine_inputs, _, _, actual_prompt_token_ids_from_engine, _, mm_kwargs) = \\
+            #     await self._process_model_inputs(request_id, prompt_input, request_copy) # This line is removed
+            
+            # actual_prompt_token_ids = actual_prompt_token_ids_from_engine if actual_prompt_token_ids_from_engine is not None else []
+
+            sampling_params = request_copy.to_sampling_params(
+                default_max_tokens=self.max_model_len,
+                logits_processor_pattern=self.logits_processor_pattern,
+                default_sampling_params=self.default_sampling_params,
+            )
+            sampling_params.temperature = 0.0
+            sampling_params.n = 1
+            if sampling_params.logprobs is None or sampling_params.logprobs == 0:
+                 sampling_params.logprobs = 1
+
+            # Ensure logprobs for SampleLogprobs (output.logprobs)
+            if sampling_params.logprobs is None or sampling_params.logprobs == 0:
+                sampling_params.logprobs = 1 
+            # request_copy.prompt_logprobs (which maps to sampling_params.prompt_logprobs) is used if set by user
+            # Also ensure prompt_logprobs for RequestOutput.prompt_logprobs if details are needed
+            if request_copy.prompt_logprobs is None and (request_copy.logprobs is not None and request_copy.logprobs > 0): # if user wants any logprobs, enable prompt ones for details
+                sampling_params.prompt_logprobs = request_copy.logprobs # or a fixed number like 1 if that's intended.
+
+            result_generator = self.engine_client.generate(
+                prompt=engine_inputs,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                **mm_kwargs
+            )
+            final_res: Optional[RequestOutput] = None
+            try:
+                async for res_output in result_generator: # Changed from 'async for _, res_batch_output in result_generator:'
+                    if isinstance(res_output, Exception):
+                        logger.error(f"Error during generation for verified completion: {res_output}", exc_info=True)
+                        return self.create_error_response(f"Engine error: {str(res_output)}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    final_res = res_output # In non-streaming, the last (and only) output is the one we want
+            except Exception as e: # Catch errors during async iteration of result_generator
+                logger.error(f"Error consuming result_generator for verified completion: {e}", exc_info=True)
+                return self.create_error_response(f"Error during engine generation: {e}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+            if final_res is None or not final_res.outputs:
+                logger.error("No output received from generation engine for verified completion.")
+                return self.create_error_response("No output from engine.", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+            completion_output = final_res.outputs[0]
+            actual_completion_token_ids = list(completion_output.token_ids)
+
+            completion_details = self._create_verified_token_details(
+                actual_completion_token_ids,
+                completion_output.logprobs, 
+                tokenizer
+            )
+
+            prompt_details = None
+            # final_res.prompt_token_ids should be the source of truth for prompt tokens from engine perspective
+            # actual_prompt_token_ids was from _process_model_inputs, should be consistent
+            engine_prompt_token_ids = final_res.prompt_token_ids if final_res.prompt_token_ids is not None else []
+            if final_res.prompt_logprobs and engine_prompt_token_ids:
+                prompt_details = self._create_verified_token_details(
+                    engine_prompt_token_ids,
+                    clamp_prompt_logprobs(final_res.prompt_logprobs),
+                    tokenizer,
+                    is_prompt_tokens=True
+                )
+            elif engine_prompt_token_ids: # If prompt_logprobs were not requested/returned but we have tokens
+                 prompt_details = self._create_verified_token_details(
+                    engine_prompt_token_ids,
+                    None, # Pass None for sample_logprobs
+                    tokenizer,
+                    is_prompt_tokens=True
+                )
+
+
+            choice = VerifiedCompletionResponseChoice(
+                index=0,
+                text=completion_output.text,
+                prompt_token_ids=engine_prompt_token_ids,
+                completion_token_ids=actual_completion_token_ids,
+                completion_token_details=completion_details or [],
+                prompt_token_details=prompt_details,
+                finish_reason=completion_output.finish_reason,
+                stop_reason=completion_output.stop_reason
+            )
+
+            num_prompt_tokens = len(engine_prompt_token_ids)
+            num_completion_tokens = len(actual_completion_token_ids)
+            usage = UsageInfo(
+                prompt_tokens=num_prompt_tokens,
+                completion_tokens=num_completion_tokens,
+                total_tokens=num_prompt_tokens + num_completion_tokens,
+                prompt_tokens_details=final_res.metrics.prompt_tokens_details if final_res.metrics else None,
+            )
+            
+            response_metadata = RequestResponseMetadata(request_id=request_id, final_usage_info=usage)
+            if raw_request and hasattr(raw_request.state, "request_metadata"):
+                raw_request.state.request_metadata = response_metadata
+
+            return VerifiedCompletionResponse(
+                id=request_id,
+                object="text_completion.verified",
+                created=created_time,
+                model=self._get_model_name(request.model),
+                choices=[choice],
+                usage=usage
+            )
+        except Exception as e:
+            logger.error(f"Error processing verified completion request: {e}")
+            return self.create_error_response(str(e), status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    # === Method for Verify Decoding (moved from OpenAIServing) ===
+    async def verify_decoding(
+        self,
+        request: VerifyDecodingRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[VerifyDecodingResponse, ErrorResponse]:
+        logger.info("Starting verify_decoding")
+        error_check_ret = await self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
+
+        lora_request = None # Explicitly None, assuming verify_decoding does not use LoRA for now
+        # If LoRA support is needed, self._maybe_get_adapters(request) can be used.
+
+        # Use default tokenizer
+        # For LoRA: tokenizer = await self.engine_client.get_tokenizer(lora_request=lora_request)
+        tokenizer = await self.engine_client.get_tokenizer()
+
+        request_id = f"verify-{self._base_request_id(raw_request)}" 
+        created_time = int(time.time())
+        
+        prompt_token_ids: list[int]
+        completion_token_ids: list[int]
+
+        try:
+            if isinstance(request.prompt, str):
+                prompt_token_ids = tokenizer.encode(request.prompt)
+            elif isinstance(request.prompt, list) and all(isinstance(x, int) for x in request.prompt):
+                prompt_token_ids = list(request.prompt) # Ensure it's a list
+            else:
+                raise ValueError("Invalid prompt format. Must be string or list of token IDs.")
+
+            if isinstance(request.completion, str):
+                completion_token_ids = tokenizer.encode(request.completion)
+            elif isinstance(request.completion, list) and all(isinstance(x, int) for x in request.completion):
+                completion_token_ids = list(request.completion) # Ensure it's a list
+            else:
+                raise ValueError("Invalid completion format. Must be string or list of token IDs.")
+        except ValueError as e: # Catch specific ValueError for format issues
+            logger.error(f"Invalid input format for verification: {e}", exc_info=True)
+            return self.create_error_response(f"Invalid input format: {str(e)}", status_code=HTTPStatus.BAD_REQUEST)
+        except Exception as e: # Catch other tokenization errors
+            logger.error(f"Error tokenizing inputs for verification: {e}", exc_info=True)
+            return self.create_error_response(f"Error tokenizing inputs: {str(e)}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        if not completion_token_ids:
+            return VerifyDecodingResponse(
+                id=request_id,
+                created=created_time,
+                object="text.verification",
+                model=self._get_model_name(request.model, lora_request=lora_request),
+                is_verified_greedy=True,
+                prompt_token_ids=prompt_token_ids,
+                completion_token_ids=completion_token_ids,
+                verification_details=[],
+                usage=UsageInfo(prompt_tokens=len(prompt_token_ids), completion_tokens=0, total_tokens=len(prompt_token_ids))
+            )
+
+        full_sequence_token_ids = prompt_token_ids + completion_token_ids
+
+        temp_engine_req_obj = CompletionRequest(model=request.model, prompt=full_sequence_token_ids) 
+
+        try:
+            prompt_input = self._tokenize_prompt_input(
+                request=temp_engine_req_obj, # Pass the temp request to reuse validation logic if any
+                tokenizer=tokenizer,
+                prompt_input=full_sequence_token_ids,
+                add_special_tokens=False 
+            )
+            engine_llm_inputs = TokensPrompt(prompt_token_ids=prompt_input["prompt_token_ids"])
+            mm_kwargs = {} 
+
+            num_prompt_logprobs = request.prompt_logprobs if request.prompt_logprobs is not None else (self.model_config.max_logprobs or 5)
+            # Ensure at least 1 if verification is to make sense, to get ranks
+            if num_prompt_logprobs == 0 and request.check_greedy:
+                 num_prompt_logprobs = 1 
+            elif num_prompt_logprobs is None: # Should not happen if above default is applied
+                 num_prompt_logprobs = 0 # Default to 0 if not checking greedy and not specified
+
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                max_tokens=1, 
+                prompt_logprobs=num_prompt_logprobs,
+                logprobs=None, 
+                skip_special_tokens=False,
+                spaces_between_special_tokens=True 
+            )
+
+            result_generator = self.engine_client.generate(
+                prompt=engine_llm_inputs, 
+                sampling_params=sampling_params, 
+                request_id=request_id,
+                lora_request=lora_request, # Pass lora_request if supported/needed by engine
+                **mm_kwargs
+            )
+            final_res: Optional[RequestOutput] = None
+            async for res_output_item in result_generator:
+                if isinstance(res_output_item, Exception):
+                    logger.error(f"Engine error during verification: {res_output_item}", exc_info=True)
+                    return self.create_error_response(f"Engine error: {str(res_output_item)}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+                final_res = res_output_item
+        except Exception as e:
+            logger.error(f"Error during engine processing for verification: {e}", exc_info=True)
+            return self.create_error_response(f"Error during engine processing: {str(e)}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        if final_res is None or final_res.prompt_logprobs is None:
+            logger.error("Verification failed: No prompt_logprobs received from engine.")
+            return self.create_error_response("Failed to get prompt logprobs from engine.", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        engine_prompt_logprobs = clamp_prompt_logprobs(final_res.prompt_logprobs)
+
+        # The engine returns logprobs for T_0 to T_N-1 based on prefix T_0...T_i-1.
+        # For our full_sequence_token_ids[j], the relevant logprobs are in engine_prompt_logprobs[j].
+        # The first token engine_prompt_logprobs[0] will be None or empty dict usually.
+        if len(engine_prompt_logprobs) != len(full_sequence_token_ids):
+            logger.warning(
+                f"Logprobs length mismatch: expected {len(full_sequence_token_ids)}, got {len(engine_prompt_logprobs)}. "
+                f"This might be due to special tokens or BOS token handling. Details: {engine_prompt_logprobs}"
+            )
+            # Attempt to align if the difference is 1 (often due to BOS not having prior logprobs)
+            # This is a heuristic. Proper alignment depends on how engine returns prompt_logprobs for the very first token.
+            if len(engine_prompt_logprobs) == len(full_sequence_token_ids) -1 and full_sequence_token_ids:
+                # Prepend None for the first token's logprobs, assuming it had no preceding context for logprobs
+                engine_prompt_logprobs = [None] + engine_prompt_logprobs
+                logger.info("Adjusted logprobs length by prepending None for the first token.")
+            else:
+                return self.create_error_response(
+                    f"Logprobs length mismatch from engine. Expected {len(full_sequence_token_ids)}, got {len(engine_prompt_logprobs)}.", 
+                    HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+
+        verification_details: list[TokenVerificationDetail] = []
+        overall_is_greedy = True if request.check_greedy else None
+
+        for i, target_token_id in enumerate(completion_token_ids):
+            idx_in_full_seq = len(prompt_token_ids) + i
+            
+            # Ensure we are within bounds for engine_prompt_logprobs
+            if idx_in_full_seq >= len(engine_prompt_logprobs):
+                logger.error(f"Index {idx_in_full_seq} out of bounds for engine_prompt_logprobs (len {len(engine_prompt_logprobs)}). Cannot verify token.")
+                # Or append a detail indicating missing logprobs
+                verification_details.append(TokenVerificationDetail(
+                    token_id=target_token_id,
+                    text=tokenizer.decode(target_token_id),
+                    logprob=0.0,
+                    is_greedy_choice=False if request.check_greedy else None,
+                    top_logprob_at_step=0.0,
+                    top_token_id_at_step=None,
+                    error_message="Logprobs not available for this step"
+                ))
+                if request.check_greedy: overall_is_greedy = False
+                continue
+
+            logprobs_for_step: Optional[dict[int, Logprob]] = engine_prompt_logprobs[idx_in_full_seq]
+            
+            token_text = tokenizer.decode(target_token_id)
+            actual_logprob_of_target: Optional[float] = None
+            rank_of_target: Optional[int] = None
+            top_logprob_at_this_step: Optional[float] = None
+            greedy_token_id_at_this_step: Optional[int] = None
+            is_choice_greedy_for_this_token: Optional[bool] = None
+            error_msg: Optional[str] = None
+
+            if logprobs_for_step is not None and isinstance(logprobs_for_step, dict):
+                target_token_logprob_obj = logprobs_for_step.get(target_token_id)
+                if target_token_logprob_obj:
+                    actual_logprob_of_target = target_token_logprob_obj.logprob
+                    rank_of_target = target_token_logprob_obj.rank
+                    token_text = target_token_logprob_obj.decoded_token 
+                else:
+                    error_msg = "Target token not found in logprobs for this step."
+                    if request.check_greedy: overall_is_greedy = False # Target not even in top-k cannot be greedy
+
+                # Find the greedy token (rank 1 or highest logprob)
+                # Check if prompt_logprobs was 0, in which case rank might not be populated
+                if num_prompt_logprobs > 0: 
+                    for t_id, lp_obj in logprobs_for_step.items():
+                        if lp_obj.rank == 1:
+                            greedy_token_id_at_this_step = t_id
+                            top_logprob_at_this_step = lp_obj.logprob
+                            break
+                
+                if greedy_token_id_at_this_step is None: # Fallback if rank 1 not found or num_prompt_logprobs was 0
+                    sorted_logprobs = sorted(logprobs_for_step.items(), key=lambda item: item[1].logprob, reverse=True)
+                    if sorted_logprobs:
+                        greedy_token_id_at_this_step = sorted_logprobs[0][0]
+                        top_logprob_at_this_step = sorted_logprobs[0][1].logprob
+                    elif not error_msg: # If sorted_logprobs is empty but we had no prior error
+                         error_msg = "Logprobs dictionary for this step was empty."
+                         if request.check_greedy: overall_is_greedy = False
+            
+            else: # logprobs_for_step is None or not a dict
+                error_msg = "Logprobs not available or in unexpected format for this step."
+                if request.check_greedy: overall_is_greedy = False
+
+            if request.check_greedy and overall_is_greedy is not False: # if already False, no need to check further for this token
+                if error_msg: # If there was an error fetching logprobs, it's not greedy
+                    is_choice_greedy_for_this_token = False
+                elif rank_of_target == 1 and rank_of_target is not None:
+                    is_choice_greedy_for_this_token = True
+                # Check if target is the greedy token if rank is not 1 (e.g. prompt_logprobs was 0)
+                elif greedy_token_id_at_this_step == target_token_id and greedy_token_id_at_this_step is not None:
+                    is_choice_greedy_for_this_token = True
+                # Allow for threshold only if ranks are not definitive or not available
+                elif actual_logprob_of_target is not None and top_logprob_at_this_step is not None and \
+                     actual_logprob_of_target >= top_logprob_at_this_step - request.greedy_logprob_threshold and \
+                     (rank_of_target is None or rank_of_target !=1) : # consider greedy if within threshold and not explicitly non-greedy rank
+                     is_choice_greedy_for_this_token = True 
+                else:
+                    is_choice_greedy_for_this_token = False
+                
+                if not is_choice_greedy_for_this_token:
+                    overall_is_greedy = False
+            elif not request.check_greedy:
+                is_choice_greedy_for_this_token = None # Not applicable
+            
+            verification_details.append(TokenVerificationDetail(
+                token_id=target_token_id,
+                text=token_text,
+                logprob=actual_logprob_of_target if actual_logprob_of_target is not None else 0.0,
+                is_greedy_choice=is_choice_greedy_for_this_token,
+                top_logprob_at_step=top_logprob_at_this_step if top_logprob_at_this_step is not None else 0.0,
+                top_token_id_at_step=greedy_token_id_at_this_step,
+                error_message=error_msg,
+                rank=rank_of_target
+            ))
+
+        usage = UsageInfo(
+            prompt_tokens=len(prompt_token_ids), # Only prompt part for original request
+            completion_tokens=len(completion_token_ids),
+            total_tokens=len(prompt_token_ids) + len(completion_token_ids),
+            # internal_processing_tokens=len(full_sequence_token_ids) # Could add this to show what engine processed
+        )
+
+        return VerifyDecodingResponse(
+            id=request_id,
+            object="text.verification",
+            created=created_time,
+            model=self._get_model_name(request.model, lora_request=lora_request),
+            is_verified_greedy=overall_is_greedy,
+            prompt_token_ids=prompt_token_ids,
+            completion_token_ids=completion_token_ids,
+            verification_details=verification_details,
+            usage=usage
         )

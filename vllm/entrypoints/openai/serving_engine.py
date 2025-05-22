@@ -36,7 +36,7 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.entrypoints.openai.tool_parsers import ToolParser
 # yapf: enable
-from vllm.inputs import TokensPrompt
+from vllm.inputs import INPUT_REGISTRY, InputContext, PromptType, TokensPrompt
 from vllm.inputs.parse import parse_and_batch_prompt
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -91,6 +91,8 @@ class OpenAIServing:
 
         self.request_logger = request_logger
         self.return_tokens_as_token_ids = return_tokens_as_token_ids
+        self.logits_processor_pattern = (
+            self.model_config.logits_processor_pattern)
 
         self._tokenizer_executor = ThreadPoolExecutor(max_workers=1)
 
