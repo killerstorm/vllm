@@ -1,0 +1,309 @@
+Okay, let's outline the plan and identify the necessary modifications to add a greedy generation verification endpoint to vLLM's OpenAI-compatible server.
+
+**1. Goal Recap**
+
+We want a new API endpoint (e.g., `/v1/verify/greedy`) that takes a `prompt` and a `completion` string. It should:
+1.  Tokenize `prompt` and `completion` separately.
+2.  Concatenate their token IDs.
+3.  Perform a *single* forward pass through the model for the combined sequence.
+4.  Retrieve the log probabilities for predicting each token *in the completion part*.
+5.  Verify if each token in the provided `completion` was indeed the one with the highest log probability (the greedy choice) at its respective position.
+6.  Return a response indicating whether the verification passed or failed.
+
+**2. Core Idea: Reusing Existing Mechanisms**
+
+The most efficient way seems to be leveraging the existing `prompt_logprobs` feature combined with preventing actual generation.
+
+*   **Treat Input as Prompt:** We'll treat the entire concatenated `prompt_tokens + completion_tokens` sequence as a single "prompt" input to the engine.
+*   **Request Logprobs:** We'll use `SamplingParams` with `prompt_logprobs` set (e.g., `prompt_logprobs=1` is sufficient, as we only need the top logprob to compare against).
+*   **Prevent Generation:** We'll set `max_tokens=0` in `SamplingParams`. This should instruct the engine to perform the forward pass to calculate logprobs for the input sequence but not generate any new tokens.
+
+**3. Necessary Code Modifications**
+
+Let's break down the required changes file by file:
+
+**File 1: `vllm/entrypoints/openai/protocol.py`**
+
+*   **Define Request Model:** Add a new Pydantic model for the verification request.
+    ```python
+    class GreedyVerificationRequest(OpenAIBaseModel):
+        model: Optional[str] = None
+        prompt: str
+        completion: str
+        add_special_tokens: bool = Field(
+            default=True,
+            description=("If true (the default), special tokens (e.g. BOS) "
+                         "will be added to the prompt part."),
+        )
+        request_id: str = Field(
+             default_factory=lambda: f"verify-{random_uuid()}",
+             description=("Unique ID for the request."))
+    ```
+*   **Define Response Model:** Add a new Pydantic model for the verification response.
+    ```python
+    class GreedyVerificationResponse(OpenAIBaseModel):
+        id: str
+        object: str = "text_verification"
+        created: int = Field(default_factory=lambda: int(time.time()))
+        model: str
+        verified: bool
+        # Optionally include logprobs for debugging/inspection later?
+        # logprobs: Optional[CompletionLogProbs] = None
+        usage: UsageInfo # Include token counts
+    ```
+
+**File 2: `vllm/entrypoints/openai/api_server.py`**
+
+*   **Import New Models:** Import `GreedyVerificationRequest` and `GreedyVerificationResponse`.
+*   **Add Endpoint:** Define a new route in the `router`.
+    ```python
+    @router.post("/v1/verify/greedy", dependencies=[Depends(validate_json_request)])
+    @with_cancellation # Or maybe @load_aware_call if it becomes heavy?
+    async def verify_greedy_completion(
+        request: GreedyVerificationRequest,
+        raw_request: Request
+    ):
+        # Decide which serving class handles this. Let's assume Completion for now.
+        handler = completion(raw_request)
+        if handler is None:
+            # Or potentially a different error if the model *exists* but doesn't
+            # support the features needed (logprobs).
+             return base(raw_request).create_error_response(
+                 message="The specified model does not support completion/verification.")
+
+        # Call the handler method
+        response = await handler.create_greedy_verification(request, raw_request)
+
+        if isinstance(response, ErrorResponse):
+            return JSONResponse(content=response.model_dump(),
+                                status_code=response.code)
+        elif isinstance(response, GreedyVerificationResponse):
+            return JSONResponse(content=response.model_dump())
+
+        # Should not happen if handler returns correct types
+        return JSONResponse(
+            content={"error": "Internal server error: Unexpected response type"},
+            status_code=500)
+    ```
+*   **Update `init_app_state` (Optional but good):** Potentially add a check or separate handler registration if verification logic becomes complex or differs significantly from completion. For now, reusing the completion handler seems feasible.
+
+**File 3: `vllm/entrypoints/openai/serving_completion.py` (or new `serving_verification.py`)**
+
+*   **Import New Models:** Import `GreedyVerificationRequest`, `GreedyVerificationResponse`.
+*   **Add Handler Method:** Implement the core logic within the `OpenAIServingCompletion` class (or a dedicated new class).
+
+    ```python
+    # Inside OpenAIServingCompletion class
+
+    async def create_greedy_verification(
+        self,
+        request: GreedyVerificationRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[GreedyVerificationResponse, ErrorResponse]:
+
+        error_check_ret = await self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
+
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+
+        request_id = request.request_id
+        created_time = int(time.time())
+        request_metadata = RequestResponseMetadata(request_id=request_id)
+        if raw_request:
+            raw_request.state.request_metadata = request_metadata
+
+
+        try:
+            (
+                lora_request,
+                prompt_adapter_request,
+            ) = self._maybe_get_adapters(request) # type: ignore [arg-type]
+
+            tokenizer = await self.engine_client.get_tokenizer(lora_request)
+
+            # 1. Tokenize Prompt and Completion Separately
+            # Use background executor for potentially blocking tokenization
+            prompt_tokens_list = await asyncio.get_event_loop().run_in_executor(
+                self._tokenizer_executor,
+                partial(tokenizer.encode, request.prompt,
+                        add_special_tokens=request.add_special_tokens)
+            )
+            completion_tokens_list = await asyncio.get_event_loop().run_in_executor(
+                self._tokenizer_executor,
+                partial(tokenizer.encode, request.completion,
+                        add_special_tokens=False) # Usually no special tokens within completion
+            )
+
+            if not completion_tokens_list:
+                 # Handle empty completion - trivially verified? Or error?
+                 # Let's say it's verified.
+                 model_name = self._get_model_name(request.model, lora_request)
+                 usage = UsageInfo(prompt_tokens=len(prompt_tokens_list),
+                                   completion_tokens=0,
+                                   total_tokens=len(prompt_tokens_list))
+                 request_metadata.final_usage_info = usage
+                 return GreedyVerificationResponse(id=request_id,
+                                                   created=created_time,
+                                                   model=model_name,
+                                                   verified=True,
+                                                   usage=usage)
+
+
+            # 2. Concatenate Tokens
+            combined_token_ids = prompt_tokens_list + completion_tokens_list
+            num_prompt_tokens = len(prompt_tokens_list)
+            num_completion_tokens = len(completion_tokens_list)
+            num_total_tokens = len(combined_token_ids)
+
+            # Check total length against model max length
+            if num_total_tokens > self.max_model_len:
+                 return self.create_error_response(
+                     f"Combined prompt and completion length ({num_total_tokens}) "
+                     f"exceeds model maximum length ({self.max_model_len})."
+                 )
+
+            # 3. Set SamplingParams for Verification
+            # We need logprobs for the input ("prompt") and generate 0 tokens.
+            # Setting temperature/top_k/p isn't strictly needed for logprob
+            # calculation but aligns with the "greedy" check conceptually.
+            sampling_params = SamplingParams(
+                prompt_logprobs=1,  # Get top logprob for the input sequence
+                max_tokens=0,       # Don't generate any new tokens
+                temperature=0.0,    # Ensure greedy-like pass if relevant internally
+                top_k=1,
+                top_p=1.0,
+                skip_special_tokens=False, # Needed to get logprobs correctly? Test this.
+                spaces_between_special_tokens=False, # Consistent with above
+            )
+
+            # 4. Prepare Engine Input
+            engine_prompt = TokensPrompt(prompt_token_ids=combined_token_ids)
+
+            # 5. Call Engine
+            # Use generate, but it will return immediately due to max_tokens=0
+            # We only expect one result since n=1 is implicit
+            # We don't need a streaming generator here.
+            try:
+                 # Use a unique ID for the engine call if needed, or reuse request_id
+                 result_generator = self.engine_client.generate(
+                     engine_prompt,
+                     sampling_params,
+                     request_id, # Reuse request_id for simplicity
+                     lora_request=lora_request,
+                     prompt_adapter_request=prompt_adapter_request,
+                     # trace_headers=..., # Add if needed
+                     # priority=... # Add if needed
+                 )
+
+                 final_res: Optional[RequestOutput] = None
+                 async for _, res in result_generator:
+                     # There should be only one result because max_tokens=0
+                     final_res = res
+                     break # Only take the first (and only) result
+
+                 if final_res is None:
+                      raise RuntimeError("Engine did not return a result for verification.")
+
+            except Exception as e:
+                 logger.exception(f"Engine error during verification for {request_id}")
+                 return self.create_error_response(f"Engine error: {e}")
+
+
+            # 6. Perform Verification Logic
+            verified = True
+            if final_res.prompt_logprobs is None:
+                logger.warning(f"Logprobs not returned for verification request {request_id}. Cannot verify.")
+                verified = False # Cannot verify without logprobs
+            else:
+                # prompt_logprobs is List[Optional[Dict[int, Logprob]]]
+                # Length should be num_total_tokens (or num_total_tokens-1?)
+                # Let's assume len == num_total_tokens for now, representing logprobs
+                # *after* processing token i-1, used to predict token i.
+                # If len == num_total_tokens - 1, adjust indices below by -1.
+
+                if len(final_res.prompt_logprobs) < num_total_tokens -1:
+                     logger.warning(f"Insufficient logprobs returned for {request_id}. "
+                                    f"Expected at least {num_total_tokens - 1}, got {len(final_res.prompt_logprobs)}. Cannot verify.")
+                     verified = False
+                else:
+                    for i in range(num_completion_tokens):
+                        completion_token_index_in_combined = num_prompt_tokens + i
+                        # Logprobs to predict token at index `completion_token_index_in_combined`
+                        # are generated *after* processing the token at index `completion_token_index_in_combined - 1`.
+                        logprobs_for_this_step = final_res.prompt_logprobs[completion_token_index_in_combined - 1]
+
+                        if logprobs_for_this_step is None:
+                            logger.warning(f"Missing logprobs for step {i} of completion for {request_id}. Cannot verify.")
+                            verified = False
+                            break
+
+                        # Find the token ID with the highest log probability
+                        top_token_id = -1
+                        max_logprob = -float('inf')
+                        for token_id, logprob_obj in logprobs_for_this_step.items():
+                            if logprob_obj.logprob > max_logprob:
+                                max_logprob = logprob_obj.logprob
+                                top_token_id = token_id
+
+                        # Get the actual token ID from the provided completion
+                        actual_token_id = completion_tokens_list[i]
+
+                        # Compare
+                        if top_token_id != actual_token_id:
+                            verified = False
+                            logger.debug(f"Verification failed at completion token {i} for {request_id}. "
+                                         f"Expected (greedy): {top_token_id}, Actual: {actual_token_id}")
+                            break # No need to check further
+
+        except ValueError as e:
+             return self.create_error_response(str(e))
+        except Exception as e:
+             logger.exception(f"Unexpected error during verification for {request_id}")
+             return self.create_error_response(f"Internal server error: {e}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+        # 7. Construct and Return Response
+        model_name = self._get_model_name(request.model, lora_request)
+        usage = UsageInfo(
+            prompt_tokens=num_prompt_tokens,
+            # Completion tokens are "used" in the sense they were processed
+            completion_tokens=num_completion_tokens,
+            total_tokens=num_total_tokens
+        )
+        request_metadata.final_usage_info = usage
+
+        return GreedyVerificationResponse(
+            id=request_id,
+            created=created_time,
+            model=model_name,
+            verified=verified,
+            usage=usage,
+            # logprobs=... # Optionally construct and add logprobs if needed
+        )
+
+    ```
+
+**File 4: `vllm/engine/llm_engine.py` (and related v0/v1 engine files)**
+
+*   **No Changes Needed (Hopefully):** The core logic relies on existing features (`prompt_logprobs`, `max_tokens=0`). We need to ensure that setting `max_tokens=0` correctly performs a forward pass and returns the `prompt_logprobs` for the entire input sequence without attempting to sample or generate. This seems likely to work based on how the engine processes prompts and handles `max_tokens`. If `max_tokens=0` causes issues (e.g., returns nothing), we might need `max_tokens=1` and just ignore the single generated token. The key is obtaining `RequestOutput.prompt_logprobs`.
+
+**File 5: `vllm/sampling_params.py`**
+
+*   **No Changes Needed:** `SamplingParams` already supports `prompt_logprobs` and `max_tokens`.
+
+**File 6: `vllm/outputs.py` (and related v0/v1 files)**
+
+*   **No Changes Needed:** `RequestOutput` already has the `prompt_logprobs` field.
+
+**4. Testing and Refinements**
+
+*   **Test `max_tokens=0`:** Verify that the engine returns the `prompt_logprobs` correctly when `max_tokens=0`. Check the length and indexing of the returned `prompt_logprobs` list relative to the input tokens.
+*   **Test Tokenization:** Ensure the separate tokenization and concatenation work as expected, especially around special tokens (BOS/EOS).
+*   **Test Verification Logic:** Create test cases with known greedy outputs and slightly modified outputs to confirm the verification logic catches discrepancies.
+*   **Performance:** Measure the latency of the endpoint. It should be roughly equivalent to processing a prompt of length `len(prompt) + len(completion)`.
+*   **Error Handling:** Test various error conditions (model not found, invalid input, length limits, engine errors).
+*   **Logprobs in Response:** Decide if returning the actual logprobs used for verification is useful and implement the population of `GreedyVerificationResponse.logprobs` if desired (using a structure similar to `CompletionLogProbs`).
+
+This approach seems minimally invasive, primarily adding new API definitions and handler logic in the OpenAI serving layer while reusing the core engine's ability to compute log probabilities for given sequences.

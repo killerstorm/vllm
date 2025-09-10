@@ -14,6 +14,7 @@ import signal
 import socket
 import tempfile
 import uuid
+import time
 from argparse import Namespace
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
@@ -76,7 +77,13 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               TranscriptionResponse,
                                               TranslationRequest,
                                               TranslationResponse,
-                                              UnloadLoRAAdapterRequest)
+                                              UnloadLoRAAdapterRequest,
+                                              VerifiedCompletionRequest,
+                                              VerifiedCompletionResponse,
+                                              VerifiedChatCompletionRequest,
+                                              VerifiedChatCompletionResponse,
+                                              VerifyDecodingRequest,
+                                              VerifyDecodingResponse)
 # yapf: enable
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_classification import (
@@ -1310,7 +1317,6 @@ if envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
 
         return Response(status_code=200, content=response)
 
-
 def load_log_config(log_config_file: Optional[str]) -> Optional[dict]:
     if not log_config_file:
         return None
@@ -1560,6 +1566,61 @@ def _log_non_streaming_response(response_body: list) -> None:
         logger.info("response_body={%s}", decoded_body)
     except UnicodeDecodeError:
         logger.info("response_body={<binary_data>}")
+
+# New Verified Endpoints
+
+@router.post("/v1/completions/verified",
+             dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def create_verified_completion(
+    request: VerifiedCompletionRequest,
+    raw_request: Request
+):
+    serv_completion = completion(raw_request)
+    if serv_completion is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Completion model not found.")
+
+    res = await serv_completion.create_verified_completion(request, raw_request)
+    if isinstance(res, ErrorResponse):
+        return JSONResponse(content=res.model_dump(), status_code=res.error.code)
+    return JSONResponse(content=res.model_dump())
+
+
+@router.post("/v1/chat/completions/verified",
+             dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def create_verified_chat_completion(
+    request: VerifiedChatCompletionRequest,
+    raw_request: Request
+):
+    serv_chat = chat(raw_request)
+    if serv_chat is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Chat model not found.")
+
+    res = await serv_chat.create_verified_chat_completion(request, raw_request)
+    if isinstance(res, ErrorResponse):
+        return JSONResponse(content=res.model_dump(), status_code=res.error.code)
+    return JSONResponse(content=res.model_dump())
+
+
+@router.post("/v1/verify_decoding",
+             dependencies=[Depends(validate_json_request)])
+@with_cancellation
+async def verify_text_decoding(
+    request: VerifyDecodingRequest,
+    raw_request: Request
+):
+    serv_completion = completion(raw_request)
+    if serv_completion is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND,
+                            "Completion model not found, cannot verify decoding.")
+
+    res = await serv_completion.verify_decoding(request, raw_request)
+    if isinstance(res, ErrorResponse):
+        return JSONResponse(content=res.model_dump(), status_code=res.error.code)
+    return JSONResponse(content=res.model_dump())
 
 
 def build_app(args: Namespace) -> FastAPI:

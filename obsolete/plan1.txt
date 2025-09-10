@@ -1,0 +1,372 @@
+Okay, let's break down the plan to add generated text verification to vLLM.
+
+**Core Idea:**
+
+We need a mechanism to take a `prompt` and a `completion`, tokenize them separately, run a single forward pass on their concatenated token sequence, retrieve log probabilities (logprobs) for *every* token in this sequence, and then check if each token in the `completion` part corresponds to the token with the highest logprob at its respective position.
+
+**Key Challenges & Considerations:**
+
+1.  **Separate Tokenization:** This is crucial as `tokenizer(prompt + completion)` might yield different token IDs than `tokenizer(prompt) + tokenizer(completion)`. The implementation must enforce this.
+2.  **Logprobs for All Tokens:** vLLM's default behavior might optimize logprob calculation (e.g., only for generated tokens or specific prompt tokens if requested). We need to ensure logprobs are computed and accessible for the *entire* input sequence (prompt + completion) during verification.
+3.  **Preventing Generation:** The forward pass should *only* compute logits/logprobs for the provided sequence. No actual sampling or generation of new tokens should occur.
+4.  **Greedy Assumption:** The verification logic itself compares against the *top* logprob, implicitly assuming a greedy generation process. The API should likely document this limitation.
+5.  **Engine Integration:** We need to integrate this logic into the vLLM engine flow, potentially adding a new request type or mode to the scheduler and worker.
+6.  **API Endpoint:** A new OpenAI-compatible endpoint is required.
+
+**Plan & File Modifications:**
+
+Here's a detailed plan outlining the necessary changes:
+
+**1. Define API Endpoint and Data Structures (`vllm/entrypoints/openai/protocol.py`)**
+
+*   **Define Request Schema:** Add a new Pydantic model for the verification request.
+    ```python
+    class VerificationRequest(OpenAIBaseModel):
+        model: Optional[str] = None
+        prompt: Union[str, list[int]] # Allow string or token IDs
+        completion: Union[str, list[int]] # Allow string or token IDs
+        # Potentially add flags later if non-greedy verification is ever needed
+        # e.g., sampling_params: Optional[SamplingParams] = None
+        request_id: str = Field(
+            default_factory=lambda: f"verify-{random_uuid()}"
+        )
+        # Add lora_request if needed
+        lora_request: Optional[LoRARequest] = None
+
+    ```
+*   **Define Response Schema:** Add a Pydantic model for the verification response.
+    ```python
+    class VerificationResult(OpenAIBaseModel):
+        token_id: int
+        token_str: str
+        is_greedy: bool
+        logprob: float
+        top_logprob_token_id: int
+        top_logprob_token_str: str
+        top_logprob: float
+        rank: Optional[int] = None # Rank of the actual completion token
+
+    class VerificationResponse(OpenAIBaseModel):
+        id: str = Field(default_factory=lambda: f"verify-resp-{random_uuid()}")
+        object: str = "verification"
+        created: int = Field(default_factory=lambda: int(time.time()))
+        model: str
+        verified: bool # True if all completion tokens were greedy
+        details: Optional[list[VerificationResult]] = None # Optional detailed results per token
+        usage: Optional[UsageInfo] = None # Number of tokens processed
+        error: Optional[ErrorResponse] = None # In case of processing errors
+    ```
+
+**2. Add API Route (`vllm/entrypoints/openai/api_server.py`)**
+
+*   Add a new route, e.g., `/v1/verify`.
+*   Implement the handler function for this route.
+    ```python
+    from vllm.entrypoints.openai.protocol import (VerificationRequest,
+                                                VerificationResponse, ErrorResponse)
+    # ... other imports
+
+    @router.post("/v1/verify", dependencies=[Depends(validate_json_request)])
+    @with_cancellation # Or potentially a different decorator if load isn't relevant
+    async def create_verification(request: VerificationRequest, raw_request: Request):
+        """
+        Verifies if the completion could have been generated greedily from the prompt.
+        """
+        engine: OpenAIServing = base(raw_request) # Or a more specific type if needed
+
+        error_check_ret = await engine._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
+
+        if engine.engine_client.errored:
+            raise engine.engine_client.dead_error
+
+        # The core logic will be in the engine_client
+        try:
+            response_or_generator = await engine.engine_client.verify(request) # Assuming verify method exists
+
+            if isinstance(response_or_generator, ErrorResponse):
+                 return JSONResponse(content=response_or_generator.model_dump(),
+                                     status_code=response_or_generator.code)
+            elif isinstance(response_or_generator, VerificationResponse):
+                 return JSONResponse(content=response_or_generator.model_dump())
+            else:
+                 # Should not happen for a non-streaming endpoint
+                 return engine.create_error_response("Unexpected response type from engine.")
+
+        except Exception as e:
+             logger.exception("Error during verification.")
+             return engine.create_error_response(str(e))
+
+    ```
+
+**3. Extend Engine Interface (`vllm/engine/async_llm_engine.py`, `vllm/engine/llm_engine.py`)**
+
+*   Add a new `verify` method to `AsyncLLMEngine` (and potentially `LLMEngine` for offline use).
+    ```python
+    # In vllm/engine/protocol.py (define the interface)
+    class EngineClient(ABC):
+        # ... other methods
+        @abstractmethod
+        async def verify(self, request: "VerificationRequest") -> "VerificationResponse":
+            pass
+
+    # In vllm/engine/async_llm_engine.py
+    class AsyncLLMEngine(EngineClient):
+        # ... existing methods
+
+        async def verify(
+            self,
+            request: VerificationRequest
+        ) -> Union[VerificationResponse, ErrorResponse]:
+            """Verifies greedy generation."""
+            if not self.is_running:
+                 if self.start_engine_loop:
+                     self.start_background_loop()
+                 else:
+                     raise AsyncEngineDeadError(...) # Existing error handling
+
+            arrival_time = time.time()
+            request_id = request.request_id
+
+            try:
+                tokenizer = await self.engine.get_tokenizer_async(request.lora_request)
+
+                # 1. Separate Tokenization
+                if isinstance(request.prompt, str):
+                    prompt_token_ids = tokenizer.encode(request.prompt)
+                else:
+                    prompt_token_ids = request.prompt
+
+                if isinstance(request.completion, str):
+                    completion_token_ids = tokenizer.encode(request.completion, add_special_tokens=False) # Avoid BOS in completion
+                else:
+                    completion_token_ids = request.completion
+
+                if not completion_token_ids:
+                     return self.engine.create_error_response("Completion cannot be empty.") # Use appropriate error creation
+
+                combined_token_ids = prompt_token_ids + completion_token_ids
+                num_prompt_tokens = len(prompt_token_ids)
+                num_completion_tokens = len(completion_token_ids)
+
+                # 2. Create specialized parameters
+                # Request logprobs for all tokens, and prevent generation.
+                # We might need a new flag or convention for 'logprobs=-1'
+                sampling_params = SamplingParams(
+                    max_tokens=0, # Prevent generation
+                    logprobs=-1,  # Signal to get all logprobs (Needs implementation detail)
+                    prompt_logprobs=-1, # Signal to get all logprobs
+                    skip_special_tokens=False, # Ensure we get logprobs for all tokens
+                    spaces_between_special_tokens=False,
+                )
+
+                # 3. Add request to the engine (Needs modification in engine core)
+                # We might need a new method or modify add_request to handle this.
+                # Let's assume a modified add_request for now.
+                # This needs to signal 'verification mode'.
+                stream = self._request_tracker.add_request(
+                    request_id,
+                    prompt=None, # Prompt text isn't strictly needed if IDs are passed
+                    prompt_token_ids=combined_token_ids, # Pass combined IDs
+                    params=sampling_params,
+                    arrival_time=arrival_time,
+                    lora_request=request.lora_request,
+                    # Add a new parameter to signal verification mode
+                    task_type="verification",
+                    num_prompt_tokens_for_verification=num_prompt_tokens,
+                )
+
+                # 4. Await result (should contain full logprobs)
+                final_output: Optional[RequestOutput] = None
+                async for output in stream.generator():
+                    # For verification, we expect only one output containing all logprobs
+                    if isinstance(output, RequestOutput): # Ensure it's the right type
+                        final_output = output
+                        # Verification doesn't stream intermediate results, break after first.
+                        if output.finished:
+                            break
+                    else:
+                        # Handle unexpected output type if necessary
+                        pass
+
+                if final_output is None or not final_output.finished:
+                    # Abort if the request didn't finish properly (e.g., cancelled)
+                    self._abort(request_id)
+                    raise ValueError(f"Verification request {request_id} did not complete.")
+
+                # 5. Perform Verification Logic
+                if final_output.outputs[0].logprobs is None:
+                     return self.engine.create_error_response("Logprobs not returned by the engine.")
+
+                all_logprobs = final_output.outputs[0].logprobs # List[Optional[Dict[int, Logprob]]]
+                all_tokens = final_output.outputs[0].token_ids # Combined token IDs actually processed
+
+                # Adjust for potential BOS token added by engine if not explicitly handled
+                # This part is tricky and depends on internal engine behavior. Let's assume
+                # all_logprobs aligns with combined_token_ids *passed* to the engine.
+                # We need logprobs for indices [num_prompt_tokens-1, ..., end-1] to predict
+                # tokens at [num_prompt_tokens, ..., end].
+
+                if len(all_logprobs) < len(combined_token_ids) -1 :
+                     return self.engine.create_error_response(
+                         f"Logprobs length mismatch. Expected at least {len(combined_token_ids)-1}, got {len(all_logprobs)}")
+
+                verified = True
+                details: list[VerificationResult] = []
+
+                for i in range(num_completion_tokens):
+                    target_token_id = completion_token_ids[i]
+                    # Logprobs at index `j` predict token at index `j+1`.
+                    # So, to check token `completion_token_ids[i]` (which is at index `num_prompt_tokens + i`
+                    # in the combined sequence), we need the logprobs from the *previous* position.
+                    logprob_index = num_prompt_tokens + i - 1
+                    step_logprobs = all_logprobs[logprob_index]
+
+                    if step_logprobs is None:
+                         verified = False
+                         # Add detail about missing logprob
+                         details.append(VerificationResult(
+                              token_id=target_token_id,
+                              token_str=tokenizer.decode([target_token_id]),
+                              is_greedy=False,
+                              logprob=float('-inf'),
+                              top_logprob_token_id=-1,
+                              top_logprob_token_str="<ERROR: No Logprobs>",
+                              top_logprob=float('-inf'),
+                              rank=None))
+                         continue # Cannot verify further for this token
+
+                    # Find the token with the highest logprob
+                    top_token_id = -1
+                    top_logprob_val = float('-inf')
+                    actual_logprob_val = float('-inf')
+                    actual_rank = None
+
+                    sorted_logprobs = sorted(step_logprobs.items(), key=lambda item: item[1].logprob, reverse=True)
+
+                    if sorted_logprobs:
+                        top_token_id = sorted_logprobs[0][0]
+                        top_logprob_val = sorted_logprobs[0][1].logprob
+
+                    is_greedy_token = (target_token_id == top_token_id)
+                    if not is_greedy_token:
+                        verified = False
+
+                    # Find the logprob and rank of the actual token
+                    if target_token_id in step_logprobs:
+                        actual_logprob_val = step_logprobs[target_token_id].logprob
+                        # Calculate rank (1-based)
+                        for rank, (tid, _) in enumerate(sorted_logprobs, 1):
+                             if tid == target_token_id:
+                                 actual_rank = rank
+                                 break
+
+                    details.append(VerificationResult(
+                         token_id=target_token_id,
+                         token_str=tokenizer.decode([target_token_id]),
+                         is_greedy=is_greedy_token,
+                         logprob=actual_logprob_val,
+                         top_logprob_token_id=top_token_id,
+                         top_logprob_token_str=tokenizer.decode([top_token_id]) if top_token_id != -1 else "<N/A>",
+                         top_logprob=top_logprob_val,
+                         rank=actual_rank,
+                    ))
+
+                # 6. Format Response
+                model_name = await self.get_model_name(request.model, request.lora_request)
+                usage_info = UsageInfo(prompt_tokens=num_prompt_tokens,
+                                       completion_tokens=num_completion_tokens,
+                                       total_tokens=num_prompt_tokens + num_completion_tokens)
+                request_metadata.final_usage_info = usage_info # Assuming request_metadata exists
+
+                return VerificationResponse(
+                    id=f"verify-resp-{request_id}",
+                    model=model_name,
+                    verified=verified,
+                    details=details, # Include details for debugging/info
+                    usage=usage_info,
+                )
+
+            except Exception as e:
+                 logger.exception(f"Error during verification for request {request_id}")
+                 # Ensure the request is aborted if it hasn't finished
+                 if request_id in self._request_tracker:
+                     self._abort(request_id)
+                 return self.engine.create_error_response(f"Internal server error during verification: {e}")
+
+
+        async def get_model_name(self, requested_model: Optional[str], lora_request: Optional[LoRARequest]):
+             # Helper to get the effective model name (potentially adapted from create_chat_completion)
+             if requested_model is not None:
+                 return requested_model
+             if lora_request is not None:
+                 # This assumes model name might change with LoRA, adjust if needed
+                 # return lora_request.lora_name # Or combine base model + lora name
+                 pass # Decide how LoRA affects the reported model name
+             # Fallback to the engine's base model name
+             model_config = await self.engine.get_model_config()
+             return model_config.served_model_name or model_config.model
+
+
+    # Add similar method to LLMEngine if needed
+    ```
+
+**4. Modify Engine Internals (Core, Scheduler, Worker, Sampler)**
+
+*   **Request Representation (`vllm/v1/request.py` or similar):**
+    *   Add fields to `EngineCoreRequest` (or a new specific request type) to signal verification mode and potentially pass `num_prompt_tokens`.
+    *   Add corresponding fields to the internal `Request` class. Add a status like `RequestStatus.VERIFYING` or a flag `is_verification: bool`.
+
+*   **Engine Core (`vllm/v1/engine/core.py`):**
+    *   Modify `EngineCore.add_request` to recognize the verification task type and pass relevant info (like `is_verification` flag, full token sequence, logprob requirements) to the scheduler.
+
+*   **Scheduler (`vllm/v1/core/sched/scheduler.py`, `interface.py`):**
+    *   Modify `schedule` method:
+        *   Identify verification requests.
+        *   Schedule the *entire* `combined_token_ids` sequence for execution in a single step.
+        *   Ensure `SequenceGroupMetadata` clearly indicates the need for logprobs for *all* tokens (e.g., by setting `prompt_logprobs` to cover the whole sequence length or using a new flag).
+        *   Ensure `do_sample=False` in `SequenceGroupMetadata` for verification requests.
+        *   Mark the sequence group as finished immediately after this single step is scheduled/executed.
+
+*   **Model Runner / Worker (`vllm/worker/model_runner.py`):**
+    *   Modify `prepare_model_input`: It needs to correctly process the `SequenceGroupMetadata` for verification tasks, ensuring the full sequence and logprob flags are handled.
+    *   Modify `execute_model`: It must understand not to perform sampling when in verification mode. It should execute the forward pass and return the logits/hidden_states required for logprob calculation.
+
+*   **Sampler (`vllm/model_executor/layers/sampler.py`):**
+    *   Modify `Sampler.forward`:
+        *   Detect if the input batch contains verification requests based on `sampling_metadata`.
+        *   For verification requests, ensure logprobs are calculated for *all* positions in the input sequence. The existing `prompt_logprobs` mechanism might be adaptable if the scheduler sets it correctly, or a new path might be needed.
+        *   Skip the actual sampling step (`_sample`) for verification requests.
+    *   Modify `get_logprobs`:
+        *   Needs to be adapted to return logprobs for *all* tokens in the input sequence when requested for verification, not just specific prompt/sample tokens. This might involve changing how `query_indices` and `next_token_ids` are populated based on a verification flag. It should return the full `logprobs` list corresponding to the `combined_token_ids`.
+
+*   **Output Processing (`vllm/v1/engine/output_processor.py`):**
+    *   Modify `process_outputs`: For verification requests, it should simply package the full logprob results (obtained from the modified `sampler.get_logprobs`) and associate them with the `RequestOutput`. It should bypass detokenization and normal finish reason processing for these requests. The `RequestOutput` needs a way to store these full logprobs. Maybe add an optional field `full_logprobs: Optional[List[Optional[Dict[int, Logprob]]]]` to `CompletionOutput`.
+
+**5. Testing:**
+
+*   Add unit tests for the verification logic (correctly identifies greedy tokens, handles edge cases like empty completion, mismatches).
+*   Add integration tests for the new API endpoint.
+*   Test with different models and tokenizers.
+*   Test with LoRA requests if supported.
+
+**Summary of Modified Files (Potential):**
+
+1.  `vllm/entrypoints/openai/protocol.py` (New request/response schemas)
+2.  `vllm/entrypoints/openai/api_server.py` (New API route and handler)
+3.  `vllm/engine/protocol.py` (Add `verify` to `EngineClient` interface)
+4.  `vllm/engine/async_llm_engine.py` (Implement `verify` method)
+5.  `vllm/engine/llm_engine.py` (Optional: Implement sync `verify`)
+6.  `vllm/v1/request.py` (or similar internal request structure) (Add verification flag/status)
+7.  `vllm/v1/engine/core.py` (Handle verification requests in `add_request`)
+8.  `vllm/v1/core/sched/scheduler.py` (Modify scheduling logic for verification)
+9.  `vllm/v1/core/sched/interface.py` (Potentially update interface)
+10. `vllm/sequence.py` (Potentially update `SequenceGroupMetadata` or related structures)
+11. `vllm/worker/model_runner.py` (Handle verification in `prepare_model_input`/`execute_model`)
+12. `vllm/model_executor/layers/sampler.py` (Modify `forward` and `get_logprobs` for full sequence logprobs and no sampling)
+13. `vllm/outputs.py` or `vllm/v1/outputs.py` (Potentially update `CompletionOutput` or `RequestOutput` to hold full logprobs)
+14. `vllm/v1/engine/output_processor.py` (Handle output packaging for verification)
+15. `vllm/sampling_params.py` (Potentially add flags/conventions to `SamplingParams` for verification mode)
+
+This detailed plan provides a roadmap. The exact implementation details, especially within the scheduler and sampler for handling the "get all logprobs" requirement, will need careful design during coding.

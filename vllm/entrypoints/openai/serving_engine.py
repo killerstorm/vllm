@@ -231,6 +231,8 @@ class OpenAIServing:
         self.request_logger = request_logger
         self.return_tokens_as_token_ids = return_tokens_as_token_ids
         self.enable_force_include_usage = enable_force_include_usage
+        self.logits_processor_pattern = (
+            self.model_config.logits_processor_pattern)
 
         self._tokenizer_executor = ThreadPoolExecutor(max_workers=1)
 

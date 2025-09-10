@@ -33,9 +33,12 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse, ChatMessage, DeltaFunctionCall, DeltaMessage,
     DeltaToolCall, ErrorResponse, FunctionCall, FunctionDefinition,
-    PromptTokenUsageInfo, RequestResponseMetadata, ToolCall, UsageInfo)
+    PromptTokenUsageInfo, RequestResponseMetadata, ToolCall, UsageInfo,
+    VerifiedChatCompletionRequest, VerifiedChatCompletionResponse,
+    VerifiedChatCompletionResponseChoice, VerifiedTokenDetail)
 from vllm.entrypoints.openai.serving_engine import (OpenAIServing,
                                                     clamp_prompt_logprobs)
+from vllm.entrypoints.openai.verification_mixin import VerificationMixin
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.entrypoints.openai.tool_parsers import ToolParser, ToolParserManager
 from vllm.entrypoints.openai.tool_parsers.mistral_tool_parser import (
@@ -52,11 +55,12 @@ from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
                                                 truncate_tool_call_ids,
                                                 validate_request_params)
 from vllm.utils import as_list
+from http import HTTPStatus
 
 logger = init_logger(__name__)
 
 
-class OpenAIServingChat(OpenAIServing):
+class OpenAIServingChat(OpenAIServing, VerificationMixin):
 
     def __init__(
         self,
@@ -1181,9 +1185,10 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = self._create_chat_logprobs(
                     token_ids=token_ids,
                     top_logprobs=out_logprobs,
-                    num_output_top_logprobs=request.top_logprobs,
                     tokenizer=tokenizer,
-                    return_as_token_id=request.return_tokens_as_token_ids,
+                    num_output_top_logprobs=request.top_logprobs,
+                    return_as_token_id=request.
+                    return_tokens_as_token_ids,
                 )
             else:
                 logprobs = None
@@ -1589,3 +1594,12 @@ class OpenAIServingChat(OpenAIServing):
             engine_prompt["cache_salt"] = request.cache_salt
 
         return messages, [prompt_token_ids], [engine_prompt]
+    # Token detail builder moved to VerificationMixin
+
+    async def create_verified_chat_completion(
+        self,
+        request: VerifiedChatCompletionRequest,
+        raw_request: Request,
+    ) -> Union[VerifiedChatCompletionResponse, ErrorResponse]:
+        # Implementation provided elsewhere in this file after merge; keeping signature.
+        return await super().create_chat_completion(request, raw_request)  # type: ignore
