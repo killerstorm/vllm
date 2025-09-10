@@ -1825,7 +1825,7 @@ class TranscriptionResponseVerbose(OpenAIBaseModel):
 class VerifiedTokenDetail(OpenAIBaseModel):
     token_id: int
     text: Optional[str] = None # Decoded token text, if available
-    logprob: float
+    logprob: Optional[float] = None
     rank: Optional[int] = None # Rank of this token (1 if it was the top choice)
     # Potentially add top_k_alternatives if easily available and desired
     # top_k_alternatives: Optional[dict[str, float]] = None # {token_text: logprob}

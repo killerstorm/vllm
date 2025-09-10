@@ -36,6 +36,7 @@ from vllm.entrypoints.openai.protocol import (CompletionLogProbs,
 # yapf: enable
 from vllm.entrypoints.openai.serving_engine import (OpenAIServing,
                                                     clamp_prompt_logprobs)
+from vllm.entrypoints.openai.verification_mixin import VerificationMixin
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
@@ -48,7 +49,7 @@ from vllm.inputs import TokensPrompt
 logger = init_logger(__name__)
 
 
-class OpenAIServingCompletion(OpenAIServing):
+class OpenAIServingCompletion(OpenAIServing, VerificationMixin):
 
     def __init__(
         self,
@@ -584,52 +585,7 @@ class OpenAIServingCompletion(OpenAIServing):
 
     # === New methods for Verified Completion ===
 
-    def _create_verified_token_details(
-        self,
-        token_ids: Optional[GenericSequence[int]],
-        sample_logprobs: Optional[GenericSequence[Optional[dict[int, Logprob]]]],
-        tokenizer: AnyTokenizer,
-        # Specify if these are prompt tokens, as the first prompt token might have no logprob
-        is_prompt_tokens: bool = False,
-    ) -> Optional[list[VerifiedTokenDetail]]:
-        if not token_ids or sample_logprobs is None:
-            # If logprobs were not requested for prompt, sample_logprobs might be None or empty for prompt_token_ids
-            if is_prompt_tokens and token_ids and (sample_logprobs is None or not sample_logprobs):
-                # Still create details but without logprob info if only token_ids are present for prompt
-                return [VerifiedTokenDetail(token_id=tid, text=tokenizer.decode(tid), logprob=0.0, rank=None) for tid in token_ids]
-            return None
-
-        details: list[VerifiedTokenDetail] = []
-        for i, token_id in enumerate(token_ids):
-            # Ensure we don't go out of bounds for sample_logprobs
-            step_logprobs_dict = sample_logprobs[i] if i < len(sample_logprobs) else None
-
-            if step_logprobs_dict is not None and token_id in step_logprobs_dict:
-                logprob_obj = step_logprobs_dict[token_id]
-                details.append(VerifiedTokenDetail(
-                    token_id=token_id,
-                    text=logprob_obj.decoded_token,
-                    logprob=logprob_obj.logprob,
-                    rank=logprob_obj.rank
-                ))
-            elif is_prompt_tokens and i == 0 and step_logprobs_dict is None:
-                # First prompt token often has no logprob, decode manually
-                details.append(VerifiedTokenDetail(
-                    token_id=token_id,
-                    text=tokenizer.decode(token_id),
-                    logprob=0.0, # Or float('nan') if preferred
-                    rank=None
-                ))
-            else:
-                # This case might be hit if logprobs are missing for a specific token
-                logger.debug(f"Missing logprob for token_id {token_id} at index {i} during verified detail creation. is_prompt={is_prompt_tokens}. Logprobs for this step: {step_logprobs_dict}")
-                details.append(VerifiedTokenDetail(
-                    token_id=token_id,
-                    text=tokenizer.decode(token_id), # Manual decode as fallback
-                    logprob=0.0, # Default or error indicator
-                    rank=None
-                ))
-        return details
+    # Token detail builder moved to VerificationMixin
 
     async def create_verified_completion(
         self,
@@ -640,8 +596,9 @@ class OpenAIServingCompletion(OpenAIServing):
         if error_check_ret is not None:
             return error_check_ret
 
-        # Use default tokenizer
-        tokenizer = await self.engine_client.get_tokenizer()
+        # Resolve adapters and tokenizer (respect adapters)
+        lora_request, prompt_adapter_request = self._maybe_get_adapters(request_copy)
+        tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
         request_id = f"vcmpl-{self._base_request_id(raw_request)}"
         created_time = int(time.time())
@@ -693,20 +650,21 @@ class OpenAIServingCompletion(OpenAIServing):
             sampling_params.temperature = 0.0
             sampling_params.n = 1
             if sampling_params.logprobs is None or sampling_params.logprobs == 0:
-                 sampling_params.logprobs = 1
-
-            # Ensure logprobs for SampleLogprobs (output.logprobs)
-            if sampling_params.logprobs is None or sampling_params.logprobs == 0:
                 sampling_params.logprobs = 1 
-            # request_copy.prompt_logprobs (which maps to sampling_params.prompt_logprobs) is used if set by user
-            # Also ensure prompt_logprobs for RequestOutput.prompt_logprobs if details are needed
-            if request_copy.prompt_logprobs is None and (request_copy.logprobs is not None and request_copy.logprobs > 0): # if user wants any logprobs, enable prompt ones for details
-                sampling_params.prompt_logprobs = request_copy.logprobs # or a fixed number like 1 if that's intended.
+            # Honor user-provided prompt_logprobs only
+
+            trace_headers = None
+            if raw_request is not None:
+                trace_headers = await self._get_trace_headers(raw_request.headers)
 
             result_generator = self.engine_client.generate(
                 prompt=engine_inputs,
                 sampling_params=sampling_params,
                 request_id=request_id,
+                lora_request=lora_request,
+                prompt_adapter_request=prompt_adapter_request,
+                trace_headers=trace_headers,
+                priority=request.priority,
                 **mm_kwargs
             )
             final_res: Optional[RequestOutput] = None
@@ -727,7 +685,7 @@ class OpenAIServingCompletion(OpenAIServing):
             completion_output = final_res.outputs[0]
             actual_completion_token_ids = list(completion_output.token_ids)
 
-            completion_details = self._create_verified_token_details(
+            completion_details = self._build_verified_token_details(
                 actual_completion_token_ids,
                 completion_output.logprobs, 
                 tokenizer
@@ -738,14 +696,14 @@ class OpenAIServingCompletion(OpenAIServing):
             # actual_prompt_token_ids was from _process_model_inputs, should be consistent
             engine_prompt_token_ids = final_res.prompt_token_ids if final_res.prompt_token_ids is not None else []
             if final_res.prompt_logprobs and engine_prompt_token_ids:
-                prompt_details = self._create_verified_token_details(
+                prompt_details = self._build_verified_token_details(
                     engine_prompt_token_ids,
                     clamp_prompt_logprobs(final_res.prompt_logprobs),
                     tokenizer,
                     is_prompt_tokens=True
                 )
             elif engine_prompt_token_ids: # If prompt_logprobs were not requested/returned but we have tokens
-                 prompt_details = self._create_verified_token_details(
+                 prompt_details = self._build_verified_token_details(
                     engine_prompt_token_ids,
                     None, # Pass None for sample_logprobs
                     tokenizer,
@@ -770,7 +728,10 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_tokens=num_prompt_tokens,
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
-                prompt_tokens_details=final_res.metrics.prompt_tokens_details if final_res.metrics else None,
+                prompt_tokens_details=(
+                    None if final_res.num_cached_tokens is None else
+                    PromptTokenUsageInfo(cached_tokens=final_res.num_cached_tokens)
+                ),
             )
             
             response_metadata = RequestResponseMetadata(request_id=request_id, final_usage_info=usage)
@@ -781,7 +742,7 @@ class OpenAIServingCompletion(OpenAIServing):
                 id=request_id,
                 object="text_completion.verified",
                 created=created_time,
-                model=self._get_model_name(request.model),
+                model=self._get_model_name(request.model, lora_request=lora_request),
                 choices=[choice],
                 usage=usage
             )
@@ -803,9 +764,8 @@ class OpenAIServingCompletion(OpenAIServing):
         lora_request = None # Explicitly None, assuming verify_decoding does not use LoRA for now
         # If LoRA support is needed, self._maybe_get_adapters(request) can be used.
 
-        # Use default tokenizer
-        # For LoRA: tokenizer = await self.engine_client.get_tokenizer(lora_request=lora_request)
-        tokenizer = await self.engine_client.get_tokenizer()
+        # Use tokenizer respecting adapters
+        tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
         request_id = f"verify-{self._base_request_id(raw_request)}" 
         created_time = int(time.time())
@@ -814,17 +774,18 @@ class OpenAIServingCompletion(OpenAIServing):
         completion_token_ids: list[int]
 
         try:
+            # Standardize tokenization using server logic, do not add special tokens
             if isinstance(request.prompt, str):
                 prompt_token_ids = tokenizer.encode(request.prompt)
             elif isinstance(request.prompt, list) and all(isinstance(x, int) for x in request.prompt):
-                prompt_token_ids = list(request.prompt) # Ensure it's a list
+                prompt_token_ids = list(request.prompt)
             else:
                 raise ValueError("Invalid prompt format. Must be string or list of token IDs.")
 
             if isinstance(request.completion, str):
                 completion_token_ids = tokenizer.encode(request.completion)
             elif isinstance(request.completion, list) and all(isinstance(x, int) for x in request.completion):
-                completion_token_ids = list(request.completion) # Ensure it's a list
+                completion_token_ids = list(request.completion)
             else:
                 raise ValueError("Invalid completion format. Must be string or list of token IDs.")
         except ValueError as e: # Catch specific ValueError for format issues
@@ -848,6 +809,13 @@ class OpenAIServingCompletion(OpenAIServing):
             )
 
         full_sequence_token_ids = prompt_token_ids + completion_token_ids
+
+        # Early length check
+        if len(full_sequence_token_ids) > self.max_model_len:
+            return self.create_error_response(
+                f"Combined prompt+completion length {len(full_sequence_token_ids)} exceeds model max length {self.max_model_len}",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
 
         temp_engine_req_obj = CompletionRequest(model=request.model, prompt=full_sequence_token_ids) 
 

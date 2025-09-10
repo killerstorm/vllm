@@ -30,6 +30,7 @@ from vllm.entrypoints.openai.protocol import (
     VerifiedChatCompletionResponseChoice, VerifiedTokenDetail)
 from vllm.entrypoints.openai.serving_engine import (OpenAIServing,
                                                     clamp_prompt_logprobs)
+from vllm.entrypoints.openai.verification_mixin import VerificationMixin
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.entrypoints.openai.tool_parsers import ToolParser, ToolParserManager
 from vllm.entrypoints.openai.tool_parsers.mistral_tool_parser import (
@@ -48,7 +49,7 @@ from http import HTTPStatus
 logger = init_logger(__name__)
 
 
-class OpenAIServingChat(OpenAIServing):
+class OpenAIServingChat(OpenAIServing, VerificationMixin):
 
     def __init__(
         self,
@@ -1183,53 +1184,7 @@ class OpenAIServingChat(OpenAIServing):
             and delta_message.tool_calls[0].function.arguments is not None
         )
 
-    def _create_verified_token_details(
-        self,
-        token_ids: Optional[GenericSequence[int]],
-        sample_logprobs: Optional[GenericSequence[Optional[dict[int, Logprob]]]],
-        tokenizer: AnyTokenizer,
-        is_prompt_tokens: bool = False,
-    ) -> Optional[list[VerifiedTokenDetail]]:
-        if not token_ids:
-            return None
-        # If logprobs were not requested for prompt, sample_logprobs might be None or empty for prompt_token_ids
-        if is_prompt_tokens and (sample_logprobs is None or not sample_logprobs):
-            # Still create details but without logprob info if only token_ids are present for prompt
-            return [VerifiedTokenDetail(token_id=tid, text=tokenizer.decode(tid), logprob=0.0, rank=None) for tid in token_ids]
-        
-        if sample_logprobs is None: # Should not happen if logprobs are requested for completion tokens
-             if not is_prompt_tokens:
-                logger.warning("sample_logprobs is None for completion tokens, cannot create verified details.")
-             return [VerifiedTokenDetail(token_id=tid, text=tokenizer.decode(tid), logprob=0.0, rank=None) for tid in token_ids]
-
-        details: list[VerifiedTokenDetail] = []
-        for i, token_id in enumerate(token_ids):
-            step_logprobs_dict = sample_logprobs[i] if i < len(sample_logprobs) else None
-
-            if step_logprobs_dict is not None and token_id in step_logprobs_dict:
-                logprob_obj = step_logprobs_dict[token_id]
-                details.append(VerifiedTokenDetail(
-                    token_id=token_id,
-                    text=logprob_obj.decoded_token,
-                    logprob=logprob_obj.logprob,
-                    rank=logprob_obj.rank
-                ))
-            elif is_prompt_tokens and i == 0 and step_logprobs_dict is None:
-                details.append(VerifiedTokenDetail(
-                    token_id=token_id,
-                    text=tokenizer.decode(token_id),
-                    logprob=0.0, 
-                    rank=None
-                ))
-            else:
-                logger.debug(f"Missing logprob for chat token_id {token_id} at index {i}. is_prompt={is_prompt_tokens}. Logprobs for this step: {step_logprobs_dict}")
-                details.append(VerifiedTokenDetail(
-                    token_id=token_id,
-                    text=tokenizer.decode(token_id),
-                    logprob=0.0,
-                    rank=None
-                ))
-        return details
+    # Token detail builder moved to VerificationMixin
 
     async def create_verified_chat_completion(
         self,
@@ -1240,8 +1195,9 @@ class OpenAIServingChat(OpenAIServing):
         if error_check_ret is not None:
             return error_check_ret
 
-        # Use default tokenizer
-        tokenizer = await self.engine_client.get_tokenizer()
+        # Resolve adapters and tokenizer (respect adapters)
+        lora_request, prompt_adapter_request = await self._maybe_get_adapters(request_copy)
+        tokenizer = await self.engine_client.get_tokenizer(lora_request)
         # Correctly get tokenizer_group - now passing the tokenizer object itself
         # tokenizer_group = await self.engine_client.get_tokenizer_group()
 
@@ -1315,11 +1271,19 @@ class OpenAIServingChat(OpenAIServing):
             logger.error(f"Unexpected error setting up verified chat request: {e}", exc_info=True)
             return self.create_error_response(f"Internal server error: {e}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
+        trace_headers = None
+        if raw_request is not None:
+            trace_headers = await self._get_trace_headers(raw_request.headers)
+
         result_generator = self.engine_client.generate(
-            prompt=engine_inputs, 
-            sampling_params=sampling_params, 
-            request_id=request_id, 
-            **mm_kwargs
+            prompt=engine_inputs,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            lora_request=lora_request,
+            prompt_adapter_request=prompt_adapter_request,
+            trace_headers=trace_headers,
+            priority=request.priority,
+            **mm_kwargs,
         )
         final_res: Optional[RequestOutput] = None
         try:
@@ -1340,7 +1304,7 @@ class OpenAIServingChat(OpenAIServing):
         actual_completion_token_ids = list(completion_output.token_ids)
         generated_text_content = completion_output.text
 
-        completion_details = self._create_verified_token_details(
+        completion_details = self._build_verified_token_details(
             actual_completion_token_ids,
             completion_output.logprobs,
             tokenizer
@@ -1349,14 +1313,14 @@ class OpenAIServingChat(OpenAIServing):
         prompt_details = None
         engine_prompt_token_ids = final_res.prompt_token_ids if final_res.prompt_token_ids is not None else []
         if final_res.prompt_logprobs and engine_prompt_token_ids:
-            prompt_details = self._create_verified_token_details(
+            prompt_details = self._build_verified_token_details(
                 engine_prompt_token_ids,
                 clamp_prompt_logprobs(final_res.prompt_logprobs),
                 tokenizer,
                 is_prompt_tokens=True
             )
         elif engine_prompt_token_ids:
-             prompt_details = self._create_verified_token_details(
+             prompt_details = self._build_verified_token_details(
                 engine_prompt_token_ids,
                 None, 
                 tokenizer,
@@ -1385,14 +1349,17 @@ class OpenAIServingChat(OpenAIServing):
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_completion_tokens,
             total_tokens=num_prompt_tokens + num_completion_tokens,
-            prompt_tokens_details=PromptTokenUsageInfo(cached_tokens=final_res.num_cached_tokens) if final_res.num_cached_tokens is not None else None
+            prompt_tokens_details=(
+                None if final_res.num_cached_tokens is None else
+                PromptTokenUsageInfo(cached_tokens=final_res.num_cached_tokens)
+            )
         )
         
         response_metadata = RequestResponseMetadata(request_id=request_id, final_usage_info=usage)
         if raw_request and hasattr(raw_request.state, "request_metadata"):
             raw_request.state.request_metadata = response_metadata
         
-        model_name = self._get_model_name(request.model)
+        model_name = self._get_model_name(request.model, lora_request=lora_request)
 
         return VerifiedChatCompletionResponse(
             id=request_id,

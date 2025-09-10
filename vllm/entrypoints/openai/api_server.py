@@ -821,7 +821,6 @@ if envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
 # New Verified Endpoints
 
 @router.post("/v1/completions/verified",
-             response_model=VerifiedCompletionResponse,
              dependencies=[Depends(validate_json_request)])
 @with_cancellation
 @load_aware_call
@@ -835,10 +834,12 @@ async def create_verified_completion(
         raise HTTPException(HTTPStatus.NOT_FOUND, "Completion model not found.")
 
     # Delegate to the new method in OpenAIServingCompletion
-    return await serv_completion.create_verified_completion(request, raw_request)
+    res = await serv_completion.create_verified_completion(request, raw_request)
+    if isinstance(res, ErrorResponse):
+        return JSONResponse(content=res.model_dump(), status_code=res.code)
+    return JSONResponse(content=res.model_dump())
 
 @router.post("/v1/chat/completions/verified",
-             response_model=VerifiedChatCompletionResponse,
              dependencies=[Depends(validate_json_request)])
 @with_cancellation
 @load_aware_call
@@ -852,10 +853,12 @@ async def create_verified_chat_completion(
         raise HTTPException(HTTPStatus.NOT_FOUND, "Chat model not found.")
 
     # Delegate to the new method in OpenAIServingChat
-    return await serv_chat.create_verified_chat_completion(request, raw_request)
+    res = await serv_chat.create_verified_chat_completion(request, raw_request)
+    if isinstance(res, ErrorResponse):
+        return JSONResponse(content=res.model_dump(), status_code=res.code)
+    return JSONResponse(content=res.model_dump())
 
 @router.post("/v1/verify_decoding",
-             response_model=VerifyDecodingResponse,
              dependencies=[Depends(validate_json_request)])
 @with_cancellation
 async def verify_text_decoding(
@@ -878,7 +881,10 @@ async def verify_text_decoding(
              return await base_handler.verify_decoding(request, raw_request)
         raise HTTPException(HTTPStatus.NOT_FOUND, "Completion model not found, cannot verify decoding.")
 
-    return await serv_completion.verify_decoding(request, raw_request)
+    res = await serv_completion.verify_decoding(request, raw_request)
+    if isinstance(res, ErrorResponse):
+        return JSONResponse(content=res.model_dump(), status_code=res.code)
+    return JSONResponse(content=res.model_dump())
 
 
 def build_app(args: Namespace) -> FastAPI:

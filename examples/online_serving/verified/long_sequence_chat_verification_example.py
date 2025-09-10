@@ -9,6 +9,7 @@ VLLM_HOST = "localhost"
 VLLM_PORT = 8000  # Default vLLM OpenAI-compatible server port
 BASE_URL = f"http://{VLLM_HOST}:{VLLM_PORT}/v1"
 MODEL_NAME = "HuggingFaceTB/SmolLM2-1.7B-Instruct"  # IMPORTANT: Change to a model loaded in your vLLM server
+MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 # --- Helper Functions (from verified_endpoints_example.py) ---
 def print_json(data, title="Response"):
