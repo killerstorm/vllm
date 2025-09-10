@@ -1601,5 +1601,170 @@ class OpenAIServingChat(OpenAIServing, VerificationMixin):
         request: VerifiedChatCompletionRequest,
         raw_request: Request,
     ) -> Union[VerifiedChatCompletionResponse, ErrorResponse]:
-        # Implementation provided elsewhere in this file after merge; keeping signature.
-        return await super().create_chat_completion(request, raw_request)  # type: ignore
+        # Ensure model exists
+        error_check_ret = await self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
+
+        try:
+            # Enforce deterministic params and ensure logprobs are available
+            request_copy = request.model_copy(deep=True)
+            self.enforce_greedy_params(request_copy)
+            request_copy.stream = False
+
+            # Resolve adapters and tokenizer (respect default multimodal loras)
+            lora_request = self._maybe_get_adapters(
+                request_copy, supports_default_mm_loras=True)
+            tokenizer = await self.engine_client.get_tokenizer(lora_request)
+
+            # Preprocess chat into engine prompts
+            (
+                conversation,
+                request_prompts,
+                engine_prompts,
+            ) = await self._preprocess_chat(
+                request_copy,
+                tokenizer,
+                request_copy.messages,
+                chat_template=request_copy.chat_template or self.chat_template,
+                chat_template_content_format=self.chat_template_content_format,
+                add_generation_prompt=request_copy.add_generation_prompt,
+                continue_final_message=request_copy.continue_final_message,
+                tool_dicts=None if request_copy.tools is None else [
+                    tool.model_dump() for tool in request_copy.tools
+                ],
+                documents=request_copy.documents,
+                chat_template_kwargs=request_copy.chat_template_kwargs,
+                tool_parser=self.tool_parser,
+                add_special_tokens=request_copy.add_special_tokens,
+            )
+
+            if not engine_prompts:
+                return self.create_error_response("No engine prompts generated")
+
+            # Compute max tokens safely
+            input_length = len(engine_prompts[0]["prompt_token_ids"])
+            if self.default_sampling_params is None:
+                self.default_sampling_params = {}
+            max_tokens = get_max_tokens(
+                max_model_len=self.max_model_len,
+                request=request_copy,
+                input_length=input_length,
+                default_sampling_params=self.default_sampling_params,
+            )
+
+            sampling_params: Union[SamplingParams, BeamSearchParams]
+            if request_copy.use_beam_search:
+                sampling_params = request_copy.to_beam_search_params(
+                    max_tokens, self.default_sampling_params)
+            else:
+                sampling_params = request_copy.to_sampling_params(
+                    max_tokens, self.model_config.logits_processor_pattern,
+                    self.default_sampling_params)
+
+            # Force greedy and ensure logprobs returned
+            if isinstance(sampling_params, SamplingParams):
+                sampling_params.temperature = 0.0
+                sampling_params.n = 1
+                if sampling_params.logprobs is None or sampling_params.logprobs == 0:
+                    sampling_params.logprobs = 1
+                # Ensure prompt logprobs available at least for 1 token if requested 0
+                if getattr(sampling_params, "prompt_logprobs", None) in (None, 0):
+                    sampling_params.prompt_logprobs = 1  # type: ignore[attr-defined]
+
+            trace_headers = None
+            if raw_request is not None:
+                trace_headers = await self._get_trace_headers(raw_request.headers)
+
+            request_id = f"vchatcmpl-{self._base_request_id(raw_request)}"
+            model_name = self._get_model_name(request.model, lora_request)
+
+            # Single prompt expected
+            engine_prompt = engine_prompts[0]
+
+            generator = self.engine_client.generate(
+                engine_prompt,
+                sampling_params,
+                request_id,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=request.priority,
+            )
+
+            final_res: Optional[RequestOutput] = None
+            async for res in generator:
+                if isinstance(res, Exception):
+                    return self.create_error_response(
+                        f"Engine error: {res}", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+                final_res = res
+
+            if final_res is None or not final_res.outputs:
+                return self.create_error_response(
+                    "No output from engine.", status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+            output = final_res.outputs[0]
+
+            # Build token details
+            completion_token_ids = list(output.token_ids)
+            completion_details = self._build_verified_token_details(
+                completion_token_ids, output.logprobs, tokenizer)
+
+            engine_prompt_token_ids = (final_res.prompt_token_ids
+                                       if final_res.prompt_token_ids is not None else [])
+            prompt_details = None
+            if final_res.prompt_logprobs and engine_prompt_token_ids:
+                prompt_details = self._build_verified_token_details(
+                    engine_prompt_token_ids,
+                    clamp_prompt_logprobs(final_res.prompt_logprobs),
+                    tokenizer,
+                    is_prompt_tokens=True,
+                )
+            elif engine_prompt_token_ids:
+                prompt_details = self._build_verified_token_details(
+                    engine_prompt_token_ids,
+                    None,
+                    tokenizer,
+                    is_prompt_tokens=True,
+                )
+
+            # Build response choice
+            role = self.get_chat_request_role(request_copy)
+            message = ChatMessage(role=role, content=output.text)
+            choice = VerifiedChatCompletionResponseChoice(
+                index=0,
+                message=message,
+                prompt_token_ids=engine_prompt_token_ids,
+                completion_token_ids=completion_token_ids,
+                completion_token_details=completion_details or [],
+                prompt_token_details=prompt_details,
+                finish_reason=output.finish_reason,
+                stop_reason=output.stop_reason,
+            )
+
+            num_prompt_tokens = len(engine_prompt_token_ids)
+            if final_res.encoder_prompt_token_ids is not None:
+                num_prompt_tokens += len(final_res.encoder_prompt_token_ids)
+            num_completion_tokens = len(completion_token_ids)
+            usage = UsageInfo(
+                prompt_tokens=num_prompt_tokens,
+                completion_tokens=num_completion_tokens,
+                total_tokens=num_prompt_tokens + num_completion_tokens,
+                prompt_tokens_details=(None if final_res.num_cached_tokens is None else
+                                       PromptTokenUsageInfo(cached_tokens=final_res.num_cached_tokens)),
+            )
+
+            response_metadata = RequestResponseMetadata(request_id=request_id,
+                                                        final_usage_info=usage)
+            if raw_request and hasattr(raw_request.state, "request_metadata"):
+                raw_request.state.request_metadata = response_metadata
+
+            return VerifiedChatCompletionResponse(
+                id=request_id,
+                created=int(time.time()),
+                model=model_name,
+                choices=[choice],
+                usage=usage,
+            )
+        except Exception as e:
+            logger.error(f"Error processing verified chat completion request: {e}")
+            return self.create_error_response(str(e), status_code=HTTPStatus.INTERNAL_SERVER_ERROR)

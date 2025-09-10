@@ -717,7 +717,7 @@ class OpenAIServingCompletion(OpenAIServing, VerificationMixin):
             return error_check_ret
 
         # Resolve adapters and tokenizer (respect adapters)
-        lora_request, prompt_adapter_request = self._maybe_get_adapters(request_copy)
+        lora_request = self._maybe_get_adapters(request)
         tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
         request_id = f"vcmpl-{self._base_request_id(raw_request)}"
@@ -731,7 +731,12 @@ class OpenAIServingCompletion(OpenAIServing, VerificationMixin):
         # prompt_logprobs are used if set by the user in the request_copy
 
         # First, tokenize the prompt to get the number of tokens for max_tokens calculation
-        prompt_input_for_max_tokens = self._tokenize_prompt_input(request_copy, tokenizer, request_copy.prompt)
+        prompt_input_for_max_tokens = await self._tokenize_prompt_input_async(
+            request_copy,
+            tokenizer,
+            request_copy.prompt,
+            add_special_tokens=request_copy.add_special_tokens,
+        )
         num_prompt_tokens_for_max_tokens = len(prompt_input_for_max_tokens["prompt_token_ids"])
 
         if request_copy.max_tokens is None:
@@ -745,7 +750,12 @@ class OpenAIServingCompletion(OpenAIServing, VerificationMixin):
             # For verified completion, the prompt_input for _process_model_inputs should be based on request_copy.prompt
             # The prompt_input_for_max_tokens was specifically for length calculation.
             # We re-tokenize here to ensure the prompt_input for the engine is fresh and complete.
-            prompt_input = self._tokenize_prompt_input(request_copy, tokenizer, request_copy.prompt)
+            prompt_input = await self._tokenize_prompt_input_async(
+                request_copy,
+                tokenizer,
+                request_copy.prompt,
+                add_special_tokens=request_copy.add_special_tokens,
+            )
 
             # Correctly prepare engine_inputs for OpenAIServingCompletion
             # Mimic parts of _preprocess_completion or standard completion setup
@@ -762,10 +772,12 @@ class OpenAIServingCompletion(OpenAIServing, VerificationMixin):
             
             # actual_prompt_token_ids = actual_prompt_token_ids_from_engine if actual_prompt_token_ids_from_engine is not None else []
 
+            # Build sampling params with correct signature (max_tokens, not default_max_tokens)
+            assert request_copy.max_tokens is not None
             sampling_params = request_copy.to_sampling_params(
-                default_max_tokens=self.max_model_len,
-                logits_processor_pattern=self.logits_processor_pattern,
-                default_sampling_params=self.default_sampling_params,
+                request_copy.max_tokens,
+                self.logits_processor_pattern,
+                self.default_sampling_params,
             )
             sampling_params.temperature = 0.0
             sampling_params.n = 1
@@ -782,7 +794,6 @@ class OpenAIServingCompletion(OpenAIServing, VerificationMixin):
                 sampling_params=sampling_params,
                 request_id=request_id,
                 lora_request=lora_request,
-                prompt_adapter_request=prompt_adapter_request,
                 trace_headers=trace_headers,
                 priority=request.priority,
                 **mm_kwargs
@@ -940,7 +951,7 @@ class OpenAIServingCompletion(OpenAIServing, VerificationMixin):
         temp_engine_req_obj = CompletionRequest(model=request.model, prompt=full_sequence_token_ids) 
 
         try:
-            prompt_input = self._tokenize_prompt_input(
+            prompt_input = await self._tokenize_prompt_input_async(
                 request=temp_engine_req_obj, # Pass the temp request to reuse validation logic if any
                 tokenizer=tokenizer,
                 prompt_input=full_sequence_token_ids,

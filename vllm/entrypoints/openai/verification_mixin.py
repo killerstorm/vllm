@@ -221,8 +221,8 @@ class VerificationMixin:
 
     def _build_verified_token_details(
         self,
-        token_ids: Optional[GenericSequence[int]],
-        sample_logprobs: Optional[GenericSequence[Optional[dict[int, Logprob]]]],
+        token_ids: Optional[list[int]],
+        sample_logprobs: Optional[list[Optional[dict[int, Logprob]]]],
         tokenizer: AnyTokenizer,
         *,
         is_prompt_tokens: bool = False,
