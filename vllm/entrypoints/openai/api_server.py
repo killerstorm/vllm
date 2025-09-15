@@ -110,6 +110,7 @@ from vllm.utils import (Device, FlexibleArgumentParser, decorate_logs,
                         set_ulimit)
 from vllm.v1.metrics.prometheus import get_prometheus_registry
 from vllm.version import __version__ as VLLM_VERSION
+from vllm.verified.router import register_verified_routes
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
@@ -438,6 +439,9 @@ def transcription(request: Request) -> OpenAIServingTranscription:
 
 def translation(request: Request) -> OpenAIServingTranslation:
     return request.app.state.openai_serving_translation
+
+# Register verified endpoints with minimal coupling
+register_verified_routes(router, chat, completion, validate_json_request)
 
 
 def engine_client(request: Request) -> EngineClient:
